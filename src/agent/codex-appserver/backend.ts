@@ -1,5 +1,6 @@
 import { log } from '../../core/logger';
 import type {
+  AgentActivity,
   AgentBackend,
   AgentEvent,
   AgentInput,
@@ -28,6 +29,55 @@ import { codexVersionAsync, resolveCodexBin } from './locate';
 import type { ServerNotification, Thread, ThreadItem, Turn } from './protocol';
 
 const APPROVAL_POLICY = 'never';
+
+type ActiveWatchdogItem = {
+  kind: NonNullable<AgentActivity['activeKind']>;
+  startedAt: number;
+};
+
+/** 从原始通知维护 watchdog 运行态。使用 Map 而非单个布尔值，避免未来并行工具
+ * 完成一个 item 时误把仍在运行的另一个 item 清掉。 */
+export function createActivityTracker(): {
+  observe(notification: ServerNotification): void;
+  snapshot(): AgentActivity;
+} {
+  let lastActivityAt = Date.now();
+  let lastMethod: string | undefined;
+  const active = new Map<string, ActiveWatchdogItem>();
+
+  return {
+    observe(notification): void {
+      const now = Date.now();
+      lastActivityAt = now;
+      lastMethod = notification.method;
+      if (notification.method === 'item/started') {
+        const item = notification.params.item;
+        const kind = item.type === 'commandExecution'
+          ? 'command'
+          : item.type === 'mcpToolCall' || item.type === 'dynamicToolCall' || item.type === 'webSearch'
+            ? 'tool'
+            : undefined;
+        if (kind) active.set(item.id, { kind, startedAt: now });
+      } else if (notification.method === 'item/completed') {
+        active.delete(notification.params.item.id);
+      } else if (notification.method === 'turn/completed' || notification.method === 'error') {
+        active.clear();
+      }
+    },
+    snapshot(): AgentActivity {
+      // 命令优先于普通工具；并行时采用最早的开始时间，诊断中的 activeFor 不会被
+      // 后启动的 item 人为缩短。
+      const items = [...active.values()];
+      const selected = items.find((item) => item.kind === 'command') ?? items[0];
+      return {
+        lastActivityAt,
+        lastMethod,
+        activeKind: selected?.kind,
+        activeSince: selected ? Math.min(...items.filter((item) => item.kind === selected.kind).map((item) => item.startedAt)) : undefined,
+      };
+    },
+  };
+}
 
 /**
  * Map a permission tier to the thread/start|resume params that enforce it.
@@ -289,7 +339,7 @@ class CodexThread implements AgentThread {
     // Liveness clock for the idle watchdog: refreshed on EVERY raw notification
     // below (even ones mapNotification drops, like command output deltas), so a
     // long-running shell command doesn't read as "wedged".
-    let lastActivityAt = Date.now();
+    const activity = createActivityTracker();
     const params: Record<string, unknown> = {
       threadId: self.sessionId,
       input: toUserInput(input),
@@ -328,7 +378,7 @@ class CodexThread implements AgentThread {
           return;
         }
         if (step.done) return;
-        lastActivityAt = Date.now();
+        activity.observe(step.value);
         const ev = mapNotification(step.value);
         if (!ev) continue;
         if (ev.type === 'turn_started') self.currentTurnId = ev.turnId;
@@ -337,7 +387,12 @@ class CodexThread implements AgentThread {
         if (ev.type === 'error' && !ev.willRetry) return;
       }
     }
-    return { events: gen(), turnId: () => self.currentTurnId, lastActivity: () => lastActivityAt };
+    return {
+      events: gen(),
+      turnId: () => self.currentTurnId,
+      lastActivity: () => activity.snapshot().lastActivityAt,
+      activity: activity.snapshot,
+    };
   }
 
   runGoal(objective: string): AgentRun {
@@ -345,7 +400,7 @@ class CodexThread implements AgentThread {
     this.currentTurnId = undefined;
     // Same liveness clock as runStreamed — the goal's 30min idle backstop must
     // also see raw activity, not just mapped events.
-    let lastActivityAt = Date.now();
+    const activity = createActivityTracker();
     async function* gen(): AsyncGenerator<AgentEvent> {
       // Clear any leftover goal on this thread FIRST. codex keeps a goal attached
       // even after it completes and re-broadcasts it on every resume (verified);
@@ -390,7 +445,7 @@ class CodexThread implements AgentThread {
           return;
         }
         if (step.done) return;
-        lastActivityAt = Date.now();
+        activity.observe(step.value);
         const ev = mapNotification(step.value);
         if (!ev) continue;
         if (ev.type === 'turn_started') {
@@ -427,7 +482,12 @@ class CodexThread implements AgentThread {
         if (ev.type === 'error' && !ev.willRetry) return; // a fatal error kills the run
       }
     }
-    return { events: gen(), turnId: () => self.currentTurnId, lastActivity: () => lastActivityAt };
+    return {
+      events: gen(),
+      turnId: () => self.currentTurnId,
+      lastActivity: () => activity.snapshot().lastActivityAt,
+      activity: activity.snapshot,
+    };
   }
 
   async clearGoal(): Promise<void> {
@@ -444,6 +504,10 @@ class CodexThread implements AgentThread {
 
   async abort(turnId: string): Promise<void> {
     await this.client.request('turn/interrupt', { threadId: this.sessionId, turnId });
+  }
+
+  async probe(): Promise<void> {
+    await this.client.request('thread/read', { threadId: this.sessionId, includeTurns: false });
   }
 
   async compact(): Promise<CompactResult> {

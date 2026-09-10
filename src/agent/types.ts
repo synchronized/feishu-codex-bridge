@@ -111,6 +111,19 @@ export interface ThreadHistory {
  */
 export type ToolKind = 'command' | 'file' | 'search' | 'tool';
 
+/** watchdog 使用的后端运行态。它只描述可观测事实，不把“进程仍在”误当成
+ * “当前 turn 一定健康”：调用方仍需在静默到期后执行一次有期限的探活。 */
+export interface AgentActivity {
+  /** 最后一条原始后端通知的时间（epoch ms）。 */
+  lastActivityAt: number;
+  /** 最后一条原始通知的方法名，供超时诊断使用。 */
+  lastMethod?: string;
+  /** 当前尚未完成的工具类别；命令与外部工具使用不同的静默期限。 */
+  activeKind?: 'command' | 'tool';
+  /** 当前工具开始时间（epoch ms）。 */
+  activeSince?: number;
+}
+
 /** Normalized stream events, mapped from app-server notifications. */
 export type AgentEvent =
   | { type: 'system'; threadId: string }
@@ -181,6 +194,8 @@ export interface AgentRun {
    * deltas). Lets the idle watchdog tell a busy-but-quiet turn (long shell
    * command, >120s npm install) from a truly wedged one. */
   lastActivity?(): number;
+  /** 包含活跃工具和最后原始事件的运行态；新 watchdog 优先使用此接口。 */
+  activity?(): AgentActivity;
 }
 
 /** Outcome of a manual {@link AgentThread.compact}. `compacted` is true iff codex
@@ -219,6 +234,8 @@ export interface AgentThread {
   steer(input: AgentInput, expectedTurnId: string): Promise<void>;
   /** interrupt the in-flight turn (watchdog 中止) */
   abort(turnId: string): Promise<void>;
+  /** 对承载当前会话的后端做轻量探活；不启动 turn，也不计作业务活动。 */
+  probe?(): Promise<void>;
   /** Summarize the thread's history to free context (thread/compact/start) and
    * resolve only once it actually finishes — compaction runs as a background
    * turn, so this drains the event stream to turn/completed. */

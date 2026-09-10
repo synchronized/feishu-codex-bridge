@@ -10,6 +10,7 @@ import { DEFAULT_BACKEND_ID, backendIds, createBackend, isBackendEntryInstalled 
 import { catalogById, projectCreatableBackends, visibleCatalog } from '../agent/catalog';
 import {
   REASONING_EFFORTS,
+  type AgentActivity,
   type AgentBackend,
   type AgentInput,
   type AgentRun,
@@ -236,7 +237,12 @@ import {
   syncAllCommentInstructions,
   syncCommentInstructions,
 } from './comments';
-import { createGracefulInterrupt, Semaphore, withIdleTimeout } from './watchdog';
+import {
+  createGracefulInterrupt,
+  Semaphore,
+  withAdaptiveIdleTimeout,
+  type WatchdogDiagnostic,
+} from './watchdog';
 
 /**
  * open_id → 姓名 的批量解析（管理员 / 白名单卡展示用）。需 contact:user.base:readonly
@@ -764,6 +770,24 @@ export function createOrchestrator(
   // the idle timeout applies immediately to every group/thread — no daemon
   // restart. `cfg` is the same object `applyPref` mutates, so this sees edits.
   const currentIdleMs = (): number => getRunIdleTimeoutMs(cfg) ?? 0;
+  /** 兼容尚未提供结构化运行态的后端：至少沿用旧的原始活动时钟。 */
+  const watchdogActivity = (run: AgentRun): (() => AgentActivity) | undefined =>
+    run.activity ?? (run.lastActivity ? () => ({ lastActivityAt: run.lastActivity!() }) : undefined);
+  const watchdogInterrupt = (thread: AgentThread, run: AgentRun): Promise<void> => {
+    const turnId = run.turnId();
+    return turnId ? thread.abort(turnId) : Promise.reject(new Error('尚未收到 turnId'));
+  };
+  const logWatchdog = (info: WatchdogDiagnostic, fields: Record<string, unknown> = {}): void => {
+    log.info('watchdog', info.stage, {
+      ...fields,
+      idleMs: info.idleForMs,
+      thresholdMs: info.thresholdMs,
+      lastMethod: info.lastMethod ?? null,
+      activeKind: info.activeKind ?? null,
+      activeForMs: info.activeSince ? Math.max(0, Date.now() - info.activeSince) : null,
+      error: info.error ?? null,
+    });
+  };
   // One queue for every DM/Web mutation of this bot's preferences. Each write
   // reads the latest committed LIVE snapshot, persists its own next snapshot,
   // then commits it to LIVE — concurrent clicks cannot erase one another.
@@ -4231,8 +4255,11 @@ export function createOrchestrator(
         // event-map 把 turn/completed 映射为 done，消费循环自然终止 → 线程与
         // 进程留用，下一条消息免 resume 冷启。turnId 未到手或 5s 内没收尾
         // （版本旧 / 挂死）才经 stopSignal 强停本地循环，按原样走杀进程恢复锤。
-        // watchdog 超时（timedOut）不变，恒走杀进程。
+        // watchdog 与手动 ⏹ 共用事件流，但采用独立的两阶段状态：watchdog 先
+        // 探活、再优雅中断，只有排空失败才强制回收进程。
         let timedOut = false;
+        let watchdogForced = false;
+        let watchdogThresholdMs = 0;
         let resolveStop!: () => void;
         const stopSignal = new Promise<void>((res) => {
           resolveStop = res;
@@ -4244,15 +4271,21 @@ export function createOrchestrator(
         });
         state.interrupt = stopper.interrupt;
         const idleMs = currentIdleMs();
-        const guarded = withIdleTimeout(
-          run.events,
+        const guarded = withAdaptiveIdleTimeout(run.events, {
           idleMs,
-          () => {
+          stop: stopSignal,
+          activity: watchdogActivity(run),
+          probe: opts.thread.probe ? () => opts.thread.probe!() : undefined,
+          interrupt: () => watchdogInterrupt(opts.thread, run),
+          onTimeout: (info) => {
             timedOut = true;
+            watchdogThresholdMs = info.thresholdMs;
           },
-          stopSignal,
-          run.lastActivity, // raw-notification liveness: a long shell command isn't "idle"
-        );
+          onForce: () => {
+            watchdogForced = true;
+          },
+          onDiagnostic: (info) => logWatchdog(info, { threadId: topicThreadId ?? null, turnId: run.turnId() ?? null }),
+        });
         // Per-turn stream-latency observability (file log `stream.timing`): locates
         // where a reply lags — first byte, backlog (lastEv vs done), push split, RTT.
         const tStart = Date.now();
@@ -4306,9 +4339,9 @@ export function createOrchestrator(
         await stream.drain(); // flush the last coalesced frame before terminal
         state.interrupt = undefined; // turn done; nothing left to interrupt
         const interrupted = stopper.interrupted();
-        // 杀进程恢复锤只留给「真出事」：watchdog 超时，或 ⏹ 后没等到干净收尾
-        // （forced）。优雅 ⏹（done 及时到达）不算 killed —— 线程与进程留用。
-        const killed = timedOut || (interrupted && stopper.forced());
+        // 杀进程恢复锤只留给优雅中断后仍没收尾的情况：watchdog 的 force，或
+        // 手动 ⏹ 的 forced。两者若及时收到 done，线程与进程均可安全复用。
+        const killed = watchdogForced || (interrupted && stopper.forced());
         // A child crash closes the notification iterator cleanly, so no error
         // event is guaranteed. Detect liveness BEFORE finalizing: only a still-
         // running render becomes error; an explicit backend done/error terminal
@@ -4317,7 +4350,7 @@ export function createOrchestrator(
         settleOrdinaryTurnRender(render, {
           interrupted,
           timedOut,
-          idleTimeoutSeconds: Math.round(idleMs / 1000),
+          idleTimeoutSeconds: Math.round((watchdogThresholdMs || idleMs) / 1000),
           procDead,
         });
         rc.rs = render.snapshot();
@@ -4715,9 +4748,17 @@ export function createOrchestrator(
       // only fires when codex goes fully silent. stopSignal/endSignal end the loop
       // WITHOUT killing the process, so we can clear the goal + recycle cleanly.
       const stop = Promise.race([stopSignal, endSignal]);
-      const guarded = withIdleTimeout(run.events, GOAL_IDLE_MS, () => {
-        idledOut = true;
-      }, stop, run.lastActivity);
+      const guarded = withAdaptiveIdleTimeout(run.events, {
+        idleMs: GOAL_IDLE_MS,
+        stop,
+        activity: watchdogActivity(run),
+        probe: opts.thread.probe ? () => opts.thread.probe!() : undefined,
+        interrupt: () => watchdogInterrupt(opts.thread, run),
+        onTimeout: () => {
+          idledOut = true;
+        },
+        onDiagnostic: (info) => logWatchdog(info, { threadId: topicThreadId ?? null, turnId: run.turnId() ?? null, source: 'goal' }),
+      });
       for await (const ev of guarded) {
         if (ev.type === 'goal_update') {
           lastStatus = ev.status;
@@ -4925,22 +4966,27 @@ export function createOrchestrator(
 
             let state: RunState = initialState;
             let timedOut = false;
-            const guarded = withIdleTimeout(run.events, currentIdleMs(), () => {
-              timedOut = true;
-            }, undefined, run.lastActivity);
+            let watchdogForced = false;
+            const guarded = withAdaptiveIdleTimeout(run.events, {
+              idleMs: currentIdleMs(),
+              activity: watchdogActivity(run),
+              probe: thread.probe ? () => thread.probe!() : undefined,
+              interrupt: () => watchdogInterrupt(thread, run),
+              onTimeout: () => {
+                timedOut = true;
+              },
+              onForce: () => {
+                watchdogForced = true;
+              },
+              onDiagnostic: (info) => logWatchdog(info, { sessionKey, turnId: run.turnId() ?? null, source: 'comment' }),
+            });
             for await (const ev of guarded) state = reduce(state, ev);
 
-            if (timedOut) {
-              const tid = run.turnId();
+            if (watchdogForced) {
               // Recycle the thread so the hung turn's never-terminating stream
               // doesn't poison the next comment; the doc resumes from the
-              // persisted thread on its next @-mention. Fire-and-forget the
-              // interrupt — turn/interrupt is an unbounded JSON-RPC round-trip,
-              // and close() SIGKILLs the child anyway, so awaiting it here would
-              // pin both the per-doc lock and a global semaphore slot if it
-              // hangs. sessions.delete stays synchronous + before release() so
-              // the next queued same-doc comment always starts fresh.
-              if (tid) void thread.abort(tid).catch(() => undefined);
+              // persisted thread on its next @-mention。watchdog 已先尝试探活和
+              // 优雅中断；这里只处理排空窗口结束后仍未收尾的强制回收。
               void thread.close().catch(() => undefined);
               sessions.delete(sessionKey);
               commentInstrUsed.delete(sessionKey);

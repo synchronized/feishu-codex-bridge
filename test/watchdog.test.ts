@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  activityIdleTimeoutMs,
+  COMMAND_IDLE_TIMEOUT_MS,
   createGracefulInterrupt,
   INTERRUPT_DRAIN_TIMEOUT_MS,
   Semaphore,
+  TOOL_IDLE_TIMEOUT_MS,
+  WATCHDOG_PROBE_GRACE_MS,
+  withAdaptiveIdleTimeout,
   withIdleTimeout,
 } from '../src/bot/watchdog';
 
@@ -209,6 +214,125 @@ describe('withIdleTimeout', () => {
 
     expect(out).toEqual(['a', 'b']);
     expect(onTimeout).not.toHaveBeenCalled();
+  });
+});
+
+describe('withAdaptiveIdleTimeout', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('按运行态提升静默期限，且不会缩短用户配置', () => {
+    const now = Date.now();
+    expect(activityIdleTimeoutMs(120_000, { lastActivityAt: now })).toBe(120_000);
+    expect(activityIdleTimeoutMs(120_000, { lastActivityAt: now, activeKind: 'command' })).toBe(COMMAND_IDLE_TIMEOUT_MS);
+    expect(activityIdleTimeoutMs(120_000, { lastActivityAt: now, activeKind: 'tool' })).toBe(TOOL_IDLE_TIMEOUT_MS);
+    expect(activityIdleTimeoutMs(60 * 60_000, { lastActivityAt: now, activeKind: 'command' })).toBe(60 * 60_000);
+  });
+
+  it('静默命令使用 30 分钟期限，不会沿用普通阶段的短期限', async () => {
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    const onTimeout = vi.fn();
+    const onForce = vi.fn();
+    const iter = withAdaptiveIdleTimeout(neverEnding('started'), {
+      idleMs: 50,
+      activity: () => ({ lastActivityAt: startedAt, activeKind: 'command', activeSince: startedAt }),
+      interrupt: async () => undefined,
+      onTimeout,
+      onForce,
+    })[Symbol.asyncIterator]();
+
+    await expect(iter.next()).resolves.toMatchObject({ value: 'started', done: false });
+    const pending = iter.next();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(onTimeout).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(COMMAND_IDLE_TIMEOUT_MS - 50);
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(INTERRUPT_DRAIN_TIMEOUT_MS);
+    await expect(pending).resolves.toMatchObject({ done: true });
+    expect(onForce).toHaveBeenCalledTimes(1);
+  });
+
+  it('探活成功只宽限一次，随后优雅中断并排空 done，不强制回收', async () => {
+    vi.useFakeTimers();
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    async function* interruptible(): AsyncGenerator<string> {
+      yield 'started';
+      await finished;
+      yield 'done';
+    }
+    const probe = vi.fn(async () => undefined);
+    const interrupt = vi.fn(async () => finish());
+    const onTimeout = vi.fn();
+    const onForce = vi.fn();
+    const stages: string[] = [];
+    const iter = withAdaptiveIdleTimeout(interruptible(), {
+      idleMs: 50,
+      probe,
+      interrupt,
+      onTimeout,
+      onForce,
+      onDiagnostic: (info) => stages.push(info.stage),
+    })[Symbol.asyncIterator]();
+
+    await expect(iter.next()).resolves.toMatchObject({ value: 'started', done: false });
+    const second = iter.next();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(interrupt).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(WATCHDOG_PROBE_GRACE_MS);
+    await expect(second).resolves.toMatchObject({ value: 'done', done: false });
+    await expect(iter.next()).resolves.toMatchObject({ done: true });
+    expect(interrupt).toHaveBeenCalledTimes(1);
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+    expect(onForce).not.toHaveBeenCalled();
+    expect(stages).toEqual(['probe-start', 'probe-ok', 'interrupt']);
+  });
+
+  it('探活失败后优雅中断；排空窗口仍无结果才触发强制回收', async () => {
+    vi.useFakeTimers();
+    const probe = vi.fn(async () => {
+      throw new Error('RPC 无响应');
+    });
+    const interrupt = vi.fn(async () => undefined);
+    const onTimeout = vi.fn();
+    const onForce = vi.fn();
+    const lastActivityAt = Date.now() - 50;
+    const diagnostics: Array<{ stage: string; lastMethod?: string; activeKind?: string; thresholdMs: number }> = [];
+    const iter = withAdaptiveIdleTimeout(neverEnding('started'), {
+      idleMs: 50,
+      activity: () => ({
+        lastActivityAt,
+        lastMethod: 'item/reasoning/textDelta',
+      }),
+      probe,
+      interrupt,
+      onTimeout,
+      onForce,
+      onDiagnostic: (info) => diagnostics.push(info),
+    })[Symbol.asyncIterator]();
+
+    await expect(iter.next()).resolves.toMatchObject({ value: 'started', done: false });
+    const pending = iter.next();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(interrupt).toHaveBeenCalledTimes(1);
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(INTERRUPT_DRAIN_TIMEOUT_MS);
+    await expect(pending).resolves.toMatchObject({ done: true });
+    expect(onForce).toHaveBeenCalledTimes(1);
+    expect(diagnostics.map((info) => info.stage)).toEqual(['probe-start', 'probe-failed', 'interrupt', 'force']);
+    expect(diagnostics[0]).toMatchObject({
+      lastMethod: 'item/reasoning/textDelta',
+      thresholdMs: 50,
+    });
   });
 });
 

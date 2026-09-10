@@ -1,3 +1,182 @@
+import type { AgentActivity } from '../agent/types';
+
+/** 静默命令（编译、测试等）不应套用模型输出的短期限。 */
+export const COMMAND_IDLE_TIMEOUT_MS = 30 * 60_000;
+/** MCP、联网搜索等外部工具的最短静默期限。 */
+export const TOOL_IDLE_TIMEOUT_MS = 10 * 60_000;
+/** 轻量 RPC 探活本身的最长等待。 */
+export const WATCHDOG_PROBE_TIMEOUT_MS = 5_000;
+/** 探活成功只宽限一次，不能靠健康的 app-server 无限掩盖卡住的 turn。 */
+export const WATCHDOG_PROBE_GRACE_MS = 60_000;
+
+export type WatchdogStage = 'probe-start' | 'probe-ok' | 'probe-failed' | 'interrupt' | 'interrupt-failed' | 'force';
+
+export interface WatchdogDiagnostic extends AgentActivity {
+  stage: WatchdogStage;
+  idleForMs: number;
+  thresholdMs: number;
+  error?: string;
+}
+
+/** 根据可观测运行态选择静默期限；用户配置始终是下限，绝不会被动态策略缩短。 */
+export function activityIdleTimeoutMs(baseIdleMs: number, activity: AgentActivity): number {
+  if (activity.activeKind === 'command') return Math.max(baseIdleMs, COMMAND_IDLE_TIMEOUT_MS);
+  if (activity.activeKind === 'tool') return Math.max(baseIdleMs, TOOL_IDLE_TIMEOUT_MS);
+  return baseIdleMs;
+}
+
+export interface AdaptiveIdleTimeoutOptions {
+  /** 普通模型阶段的静默期限；<= 0 表示关闭。 */
+  idleMs: number;
+  /** 外部手动终止信号。 */
+  stop?: Promise<unknown>;
+  /** 后端运行态；缺失时退化为固定静默期限。 */
+  activity?: () => AgentActivity;
+  /** 软超时后的轻量后端探活。 */
+  probe?: () => Promise<void>;
+  /** 探活成功后的单次宽限。 */
+  probeGraceMs?: number;
+  probeTimeoutMs?: number;
+  /** 宽限耗尽或探活失败后优雅中断当前 turn。 */
+  interrupt?: () => Promise<void>;
+  interruptDrainMs?: number;
+  /** 确认该轮已超时（开始优雅中断时触发）。 */
+  onTimeout: (diagnostic: WatchdogDiagnostic) => void;
+  /** 优雅中断后仍未收尾，即将由调用方强制回收。 */
+  onForce?: (diagnostic: WatchdogDiagnostic) => void;
+  onDiagnostic?: (diagnostic: WatchdogDiagnostic) => void;
+}
+
+type ProbeResult = { ok: true } | { ok: false; error: string };
+
+async function probeWithin(probe: () => Promise<void>, timeoutMs: number): Promise<ProbeResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      probe().then(
+        (): ProbeResult => ({ ok: true }),
+        (err: unknown): ProbeResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }),
+      ),
+      new Promise<ProbeResult>((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false, error: `探活超过 ${timeoutMs}ms` }), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * 状态感知的两阶段 watchdog：
+ *  1. 按模型/命令/外部工具选择静默期限；
+ *  2. 到期后探活，成功只给予一次短宽限；
+ *  3. 宽限耗尽或探活失败则优雅 interrupt，并继续排空事件流；
+ *  4. interrupt 后仍不收尾才结束本地流，由调用方强制回收进程。
+ */
+export async function* withAdaptiveIdleTimeout<T>(
+  source: AsyncIterable<T>,
+  opts: AdaptiveIdleTimeoutOptions,
+): AsyncGenerator<T> {
+  if ((!opts.idleMs || opts.idleMs <= 0) && !opts.stop) {
+    yield* source;
+    return;
+  }
+
+  const iter = source[Symbol.asyncIterator]();
+  const stopRace = opts.stop?.then(() => '__stop__' as const);
+  let pendingNext: Promise<IteratorResult<T>> | undefined;
+  let probeForActivityAt: number | undefined;
+  let graceDeadline = 0;
+  let graceForActivityAt: number | undefined;
+  let interruptDeadline = 0;
+  let fallbackActivityAt = Date.now();
+
+  const snapshot = (): AgentActivity => opts.activity?.() ?? { lastActivityAt: fallbackActivityAt };
+  const diagnostic = (stage: WatchdogStage, activity: AgentActivity, thresholdMs: number, error?: string): WatchdogDiagnostic => ({
+    ...activity,
+    stage,
+    idleForMs: Math.max(0, Date.now() - activity.lastActivityAt),
+    thresholdMs,
+    error,
+  });
+
+  while (true) {
+    const activity = snapshot();
+    const thresholdMs = activityIdleTimeoutMs(opts.idleMs, activity);
+    if (graceForActivityAt !== activity.lastActivityAt) {
+      graceDeadline = 0;
+      graceForActivityAt = undefined;
+    }
+    const deadline = interruptDeadline || graceDeadline || (activity.lastActivityAt + thresholdMs);
+    const waitMs = Math.max(0, deadline - Date.now());
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    pendingNext ??= iter.next();
+    const races: Promise<IteratorResult<T> | '__idle__' | '__stop__'>[] = [pendingNext];
+    if (opts.idleMs > 0) {
+      races.push(new Promise<'__idle__'>((resolve) => {
+        timer = setTimeout(() => resolve('__idle__'), waitMs);
+      }));
+    }
+    if (stopRace) races.push(stopRace);
+    const raced = await Promise.race(races);
+    if (timer) clearTimeout(timer);
+    if (raced === '__stop__') return;
+    if (raced !== '__idle__') {
+      pendingNext = undefined;
+      if (raced.done) return;
+      fallbackActivityAt = Date.now();
+      yield raced.value;
+      continue;
+    }
+
+    const current = snapshot();
+    const currentThresholdMs = activityIdleTimeoutMs(opts.idleMs, current);
+    if (interruptDeadline) {
+      const info = diagnostic('force', current, currentThresholdMs);
+      opts.onDiagnostic?.(info);
+      opts.onForce?.(info);
+      return;
+    }
+
+    // 定时器与刚到达的原始通知可能同一时刻竞争；活动时钟前进后重新计算，不能误杀。
+    if (current.lastActivityAt !== activity.lastActivityAt && Date.now() - current.lastActivityAt < currentThresholdMs) {
+      continue;
+    }
+
+    if (opts.probe && probeForActivityAt !== current.lastActivityAt) {
+      opts.onDiagnostic?.(diagnostic('probe-start', current, currentThresholdMs));
+      const result = await probeWithin(opts.probe, opts.probeTimeoutMs ?? WATCHDOG_PROBE_TIMEOUT_MS);
+      const afterProbe = snapshot();
+      if (afterProbe.lastActivityAt !== current.lastActivityAt) continue;
+      probeForActivityAt = current.lastActivityAt;
+      if (result.ok) {
+        const info = diagnostic('probe-ok', current, currentThresholdMs);
+        opts.onDiagnostic?.(info);
+        graceForActivityAt = current.lastActivityAt;
+        graceDeadline = Date.now() + (opts.probeGraceMs ?? WATCHDOG_PROBE_GRACE_MS);
+        continue;
+      }
+      opts.onDiagnostic?.(diagnostic('probe-failed', current, currentThresholdMs, result.error));
+    }
+
+    graceDeadline = 0;
+    const info = diagnostic('interrupt', current, currentThresholdMs);
+    opts.onDiagnostic?.(info);
+    opts.onTimeout(info);
+    interruptDeadline = Date.now() + (opts.interruptDrainMs ?? INTERRUPT_DRAIN_TIMEOUT_MS);
+    if (opts.interrupt) {
+      void opts.interrupt().catch((err: unknown) => {
+        opts.onDiagnostic?.(diagnostic(
+          'interrupt-failed',
+          snapshot(),
+          currentThresholdMs,
+          `中断请求失败：${err instanceof Error ? err.message : String(err)}`,
+        ));
+      });
+    }
+  }
+}
+
 /**
  * Wrap an async iterable with a per-event idle timeout and an optional external
  * stop signal. If no event arrives within `idleMs`, calls `onTimeout()` and
