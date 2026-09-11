@@ -7,6 +7,7 @@ import { createOrchestrator } from './handle-message';
 import { paths } from '../config/paths';
 import { listProjects } from '../project/registry';
 import { createCliBridgeService, shouldStartCliBridge } from '../cli-bridge';
+import { createLarkProxyTransport } from '../utils/network-proxy';
 
 /** True when `cwd` is a registered project's working dir (or a subdir of one) —
  *  drives the 'bound_projects' notify scope. Trailing slashes normalized so
@@ -49,10 +50,19 @@ export interface BridgeHandle {
  */
 export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
   const app = opts.cfg.accounts.app;
+  const domain = app.tenant === 'lark' ? Domain.Lark : Domain.Feishu;
+  const apiBaseUrl = app.tenant === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn';
+  const proxy = createLarkProxyTransport(apiBaseUrl);
+  if (proxy) log.info('ws', 'proxy', { url: proxy.displayUrl });
   const channel = createLarkChannel({
     appId: app.id,
     appSecret: opts.appSecret,
-    domain: app.tenant === 'lark' ? Domain.Lark : Domain.Feishu,
+    domain,
+    // Route both REST/auth and wss through the same CONNECT-capable agent.
+    // Without these explicit hooks Axios' env-proxy adapter is incompatible
+    // with v2rayN/xray for HTTPS absolute-form requests.
+    httpInstance: proxy?.httpInstance,
+    agent: proxy?.agent,
     source: 'feishu-codex-bridge',
     // surface raw events so card-action handlers can read form submissions
     // (action.form_value) — used by the new-project form.

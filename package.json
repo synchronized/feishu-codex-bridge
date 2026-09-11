@@ -29,14 +29,18 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.65.0",
+    "axios": "1.13.6",
     "commander": "^12.1.0",
     "cross-spawn": "^7.0.6",
+    "https-proxy-agent": "^7.0.6",
+    "proxy-from-env": "^1.1.0",
     "qrcode-terminal": "^0.12.0"
   },
   "devDependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.178",
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^22.10.0",
+    "@types/proxy-from-env": "^1.0.4",
     "@types/qrcode-terminal": "^0.12.2",
     "tsup": "^8.3.5",
     "typescript": "^5.6.3",
