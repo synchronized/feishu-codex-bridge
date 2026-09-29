@@ -11,6 +11,9 @@ import { createAdminService } from '../../admin/service';
 import { installBackendDep, uninstallBackendDep } from '../../agent';
 import { spawnDaemonControl } from './daemon-control';
 import { mountWebConsole, type MountedWebConsole } from '../../web/mount';
+import { listProjects, migrateProjectsToBackendProfiles } from '../../project/registry';
+import { formatStartupProjectSummary, summarizeStartupProject } from '../../project/startup-summary';
+import type { AppConfig } from '../../config/schema';
 
 /**
  * `run` — foreground long-connection bot(s).
@@ -159,6 +162,9 @@ async function runSingle(botName?: string): Promise<void> {
   recordServicePid();
 
   const fallbackCwd = process.env.FEISHU_CODEX_CWD || process.cwd();
+  const migratedProjects = await migrateProjectsToBackendProfiles(cfg);
+  if (migratedProjects > 0) log.info('run', 'project-profile-migrated', { count: migratedProjects });
+  await printStartupProjects(cfg);
   console.log('\n正在启动长连接 bot…');
   console.log('私聊我 `/new <名>` 建项目；在项目群里 @我 干活。Ctrl+C 退出。\n');
   const handle = await startBridge({ cfg, appSecret: secret, fallbackCwd });
@@ -252,4 +258,25 @@ async function runSingle(botName?: string): Promise<void> {
 
   // keep the process alive; the WS connection drives everything.
   await new Promise<never>(() => {});
+}
+
+/** 启动时打印当前 bot 的项目运行参数，便于从 service.log 直接确认后端/profile。 */
+async function printStartupProjects(cfg: AppConfig): Promise<void> {
+  try {
+    const projects = await listProjects();
+    console.log(`\n📁 当前项目（${projects.length}）：`);
+    if (projects.length === 0) {
+      console.log('  （暂无项目）');
+      return;
+    }
+    for (const project of projects) {
+      const summary = summarizeStartupProject(project, cfg);
+      console.log(`  • ${formatStartupProjectSummary(summary)}`);
+      log.info('run', 'project-config', { ...summary });
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`⚠ 无法读取启动项目列表：${message}`);
+    log.warn('run', 'project-list-failed', { err: message });
+  }
 }

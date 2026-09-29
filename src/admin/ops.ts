@@ -1,5 +1,5 @@
 import { backendIds } from '../agent';
-import { resolveBackendProfile } from '../agent/profiles';
+import { backendForProfile, defaultProfileForBackend, resolveBackendProfile } from '../agent/profiles';
 import { catalogById } from '../agent/catalog';
 import type { AgentBackend, BackendProbe, PermissionMode, ReasoningEffort } from '../agent/types';
 import { tierLabel, type BackendProbeRow } from '../card/dm-cards';
@@ -220,8 +220,7 @@ export async function performBackendSwitch(opts: {
   return { ok: true, project: await freshOr(opts.projectName, { ...p, backend: opts.target }) };
 }
 
-/** 为项目选择命名后端配置。只影响后续创建/手动恢复的会话；既有会话持有环境
- * 快照，不会被换账号。空名称表示回到 daemon 环境。 */
+/** 为项目选择后端 profile。profile 同时决定 backend 与环境；既有会话持有快照不变。 */
 export async function performSetBackendProfile(opts: {
   cfg: AppConfig;
   projectName: string;
@@ -229,16 +228,17 @@ export async function performSetBackendProfile(opts: {
 }): Promise<AdminWriteOutcome> {
   const p = await getProjectByName(opts.projectName);
   if (!p) return { ok: false, reason: `项目「${opts.projectName}」不存在` };
-  const profile = opts.profile?.trim() ?? '';
-  if (profile) {
-    try {
-      resolveBackendProfile(opts.cfg, profile, p.backend ?? 'codex-appserver');
-    } catch (err) {
-      return { ok: false, reason: err instanceof Error ? err.message : String(err) };
-    }
+  let profile = opts.profile?.trim() ?? '';
+  try {
+    const currentBackend = backendForProfile(opts.cfg, p.backendProfile, p.backend ?? 'codex-appserver');
+    profile ||= defaultProfileForBackend(currentBackend);
+    const targetBackend = backendForProfile(opts.cfg, profile);
+    resolveBackendProfile(opts.cfg, profile, targetBackend);
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
   }
-  await updateProject(opts.projectName, { backendProfile: profile });
-  return { ok: true, project: await freshOr(opts.projectName, { ...p, backendProfile: profile }) };
+  await updateProject(opts.projectName, { backendProfile: profile, backend: undefined });
+  return { ok: true, project: await freshOr(opts.projectName, { ...p, backend: undefined, backendProfile: profile }) };
 }
 
 /**
@@ -247,6 +247,7 @@ export async function performSetBackendProfile(opts: {
  * 生效（codex 沙箱在 thread/start 绑定后不可变）。mode/guestMode 缺省 = 不改。
  */
 export async function performSetPermissionMode(opts: {
+  cfg?: Pick<AppConfig, 'backendProfiles'>;
   projectName: string;
   mode?: PermissionMode;
   guestMode?: PermissionMode;
@@ -264,7 +265,13 @@ export async function performSetPermissionMode(opts: {
   // 若把档改到该后端的 supportedModes 之外（某后端若只支持部分档，却改到档外），
   // 新话题会在 backend.startThread 的 fail-closed 守卫处直接抛错、整群卡死。提前在这里拦住，
   // 给清晰原因，而不是让用户改完才发现聊不了。codex（supportedModes undefined）全档放行。
-  const entry = p.backend ? catalogById(p.backend) : undefined;
+  let backendId = p.backend;
+  try {
+    backendId = backendForProfile(opts.cfg ?? {}, p.backendProfile, p.backend ?? 'codex-appserver');
+  } catch {
+    // 损坏的 profile 继续按 legacy backend 做权限守门；运行时会给出明确配置错误。
+  }
+  const entry = backendId ? catalogById(backendId) : undefined;
   if (entry?.supportedModes) {
     const resMode = opts.mode ?? effectiveMode(p);
     const resGuest = opts.guestMode ?? effectiveGuestMode(p);
@@ -406,6 +413,7 @@ export async function runAdminWriteOp(
       return performSetBackendProfile({ cfg: deps.cfg, projectName: op.project, profile: op.profile });
     case 'setPermissionMode':
       return performSetPermissionMode({
+        cfg: deps.cfg,
         projectName: op.project,
         mode: op.mode,
         guestMode: op.guestMode,

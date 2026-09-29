@@ -1,5 +1,6 @@
 import { createInterface } from 'node:readline/promises';
 import { loadConfig, saveConfig, buildEncryptedAccountConfig } from '../config/store';
+import { ensureDefaultBackendProfiles } from '../agent/profiles';
 import { setSecret } from '../config/keystore';
 import { isComplete, secretKeyForApp, type AppConfig } from '../config/schema';
 import { resolveAppSecret } from '../config/secret-resolver';
@@ -98,6 +99,7 @@ export async function ensureOnboarded(
     console.error(`✗ 当前机器人「${entry.name}」(${entry.appId}) 配置缺失或损坏。可 \`bot rm ${entry.name}\` 后重新 \`bot init\`。`);
     return null;
   }
+  if (ensureDefaultBackendProfiles(cfg)) await saveConfig(cfg);
   const r = await validateAndReport(cfg);
   if (r === null) return null;
   return { cfg, secret: r.secret, missingScopes: r.missingScopes, events: r.events };

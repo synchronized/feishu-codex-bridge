@@ -20,7 +20,11 @@ import {
   type PermissionMode,
   type ReasoningEffort,
 } from '../agent/types';
-import { resolveBackendProfile } from '../agent/profiles';
+import {
+  backendForProfile,
+  DEFAULT_CODEX_PROFILE,
+  resolveBackendProfile,
+} from '../agent/profiles';
 import type { SelectOption } from '../card/cards';
 import {
   createAppPreferencesWriter,
@@ -386,6 +390,53 @@ function backendOptionsFor(mode: PermissionMode): SelectOption[] {
   return opts.length > 1 ? opts : [];
 }
 
+const NAMED_BACKEND_PROFILE_PREFIX = 'profile:';
+
+/** 新建/绑定项目卡的命名配置选项。只展示可公开的 profile 名、后端和 CODEX_HOME。 */
+export function backendProfileOptionsFor(
+  cfg: Pick<AppConfig, 'backendProfiles'>,
+  mode: PermissionMode = 'full',
+): SelectOption[] {
+  const options: SelectOption[] = [];
+  for (const [name, profile] of Object.entries(cfg.backendProfiles ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+    if (!profile) continue;
+    const entry = catalogById(profile.backend);
+    if (!entry) continue;
+    if (entry.supportedModes && !entry.supportedModes.includes(mode)) continue;
+    if (entry.id !== DEFAULT_BACKEND_ID && !isBackendEntryInstalled(entry)) continue;
+    const backendName = entry.displayName;
+    const codexHome = profile.env?.CODEX_HOME;
+    options.push({
+      label: `${backendName} / ${name}${codexHome ? ` · ${codexHome}` : ''}`,
+      value: `${NAMED_BACKEND_PROFILE_PREFIX}${name}`,
+    });
+  }
+  return options.sort((a, b) => {
+    const preferred = `${NAMED_BACKEND_PROFILE_PREFIX}${DEFAULT_CODEX_PROFILE}`;
+    if (a.value === preferred) return -1;
+    if (b.value === preferred) return 1;
+    return a.label.localeCompare(b.label);
+  });
+}
+
+/**
+ * 收口卡片提交的命名配置，并校验它真实存在且属于所选后端。编码前缀避免名为
+ * `inherit` 的合法 profile 与“继承环境”选项冲突。
+ */
+export function safeBackendProfileName(
+  formValue: Record<string, unknown> | undefined,
+  cfg: Pick<AppConfig, 'backendProfiles'>,
+): string {
+  const value = selectValue(formValue, 'backendProfile');
+  if (!value) throw new Error('请选择后端 Profile');
+  if (!value.startsWith(NAMED_BACKEND_PROFILE_PREFIX)) throw new Error('所选后端配置无效，请重新选择');
+  const name = value.slice(NAMED_BACKEND_PROFILE_PREFIX.length).trim();
+  if (!name) throw new Error('所选后端配置无效，请重新选择');
+  const backend = backendForProfile(cfg, name);
+  resolveBackendProfile(cfg, name, backend);
+  return name;
+}
+
 /**
  * 绑定『已有群』时该项目落哪个权限档。joined 群默认只读 qa（外部群安全考量）——但
  * claude 系后端仅支持 full，若用户在绑定卡里显式选了它，就以它支持的档（full）绑定，
@@ -673,7 +724,7 @@ export function createOrchestrator(
 
   /** 会话后端是否支持 `/goal` 自治目标（codex caps undefined ⇒ true）。 */
   function goalCapable(project?: Project): boolean {
-    return backendFor(project?.backend).capabilities?.goal ?? true;
+    return backendFor(projectBackendId(project)).capabilities?.goal ?? true;
   }
 
   /** 后端不支持 `/goal` 时的统一回执。关键：在「加 OKR reaction / 起 reserved run」之前
@@ -697,15 +748,22 @@ export function createOrchestrator(
   /** 项目选择的命名后端配置。解析失败必须在启动会话前显式报错，绝不静默回落
    * daemon 环境，否则很容易用错 Codex 账号。 */
   function projectBackendRuntime(project: Project | undefined): {
+    backend: string;
     profile?: string;
     env?: BackendEnvironment;
   } {
-    if (!project?.backendProfile) return {};
-    const backendId = project.backend ?? DEFAULT_BACKEND_ID;
+    const backendId = projectBackendId(project);
+    if (!project?.backendProfile) return { backend: backendId };
     return {
+      backend: backendId,
       profile: project.backendProfile,
       env: resolveBackendProfile(cfg, project.backendProfile, backendId),
     };
+  }
+
+  /** 新项目由 profile 决定 backend；backend 字段仅用于未迁移旧项目。 */
+  function projectBackendId(project: Project | undefined): string {
+    return backendForProfile(cfg, project?.backendProfile, project?.backend ?? DEFAULT_BACKEND_ID);
   }
 
   /** 会话优先使用创建时持久化的环境快照；只有较早的过渡记录才按 profile 名回查。 */
@@ -1476,13 +1534,19 @@ export function createOrchestrator(
           // Unknown session (created before this bridge, or store lost): treat as
           // a fresh session bound to the resolved cwd, on the project's backend.
           const cwd = project?.cwd ?? fallbackCwd;
-          const be = backendFor(project?.backend);
           const runtime = projectBackendRuntime(project);
+          const be = backendFor(runtime.backend);
           thread = await be.startThread({ cwd, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact, env: runtime.env });
           trackSession(sessionKey, thread);
           // 自愈观测：来源=全新会话（无持久化记录），与 resume-ok/resume-recreate
           // 互斥——三者其一 + agent 层的 spawn/prewarm-hit 即可还原完整恢复路径。
-          log.info('agent', 'session-fresh', { sessionKey, sessionId: thread.sessionId, backend: be.id });
+          log.info('agent', 'session-fresh', {
+            sessionKey,
+            sessionId: thread.sessionId,
+            backend: be.id,
+            project: project?.name ?? 'unbound',
+            profile: runtime.profile ?? 'default',
+          });
           titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource, runtime.env);
           await upsertSession({
             threadId: sessionKey,
@@ -1504,7 +1568,7 @@ export function createOrchestrator(
         } else if (recreated) {
           // resume 失败后创建的是一个全新的 HOST 会话；它属于升级后的新会话，
           // 应独立登记标题任务（旧 sessionId 的 ledger/标题绝不复用）。
-          const be = backendFor(prior?.backend ?? project?.backend);
+          const be = backendFor(prior?.backend ?? projectBackendId(project));
           const cwd = project?.cwd ?? prior?.cwd ?? fallbackCwd;
           const backendEnv = prior ? sessionBackendEnv(prior) : projectBackendRuntime(project).env;
           titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource, backendEnv);
@@ -1525,7 +1589,7 @@ export function createOrchestrator(
           // `/clear` 先创建一个没有首条提问的 waiting_source job；只有它能在
           // 此处被补源。手动 `/resume` 没有 ledger row，attach 返回 false，因而
           // 不会给导入/历史会话自动改名。
-          const be = backendFor(prior?.backend ?? project?.backend);
+          const be = backendFor(prior?.backend ?? projectBackendId(project));
           const expected = sessionTitleJobKey(be.id, thread.sessionId);
           if (prior?.titleJobKey === expected) {
             await attachSessionTitleSource(be.id, thread.sessionId, titleSource);
@@ -1639,7 +1703,13 @@ export function createOrchestrator(
       trackSession(threadId, resumed);
       // 自愈观测：resume 来源=持久化记录（区分「resume 自愈」与 LIVE 快路径的
       // 普通续轮——后者不经过这里，stream.timing 的 tResolve≈0 是它的指纹）。
-      log.info('agent', 'resume-ok', { threadId, sessionId: rec.sessionId, backend: be.id });
+      log.info('agent', 'resume-ok', {
+        threadId,
+        sessionId: rec.sessionId,
+        backend: be.id,
+        project: project?.name ?? 'unbound',
+        profile: rec.backendProfile ?? 'default',
+      });
       return { thread: resumed, recreated: false };
     } catch (err) {
       log.fail('agent', err, { phase: 'resume-on-turn', threadId });
@@ -1658,7 +1728,13 @@ export function createOrchestrator(
       // new thread id so a later restart doesn't keep resuming the dead one.
       await patchSession(threadId, { sessionId: fresh.sessionId }).catch(() => undefined);
       // 自愈观测：resume 失败已重建全新线程（codex 历史为空，调用方会回灌话题上文）。
-      log.info('agent', 'resume-recreate', { threadId, sessionId: fresh.sessionId, backend: be.id });
+      log.info('agent', 'resume-recreate', {
+        threadId,
+        sessionId: fresh.sessionId,
+        backend: be.id,
+        project: project?.name ?? 'unbound',
+        profile: rec.backendProfile ?? 'default',
+      });
       return { thread: fresh, recreated: true };
     }
   }
@@ -1708,8 +1784,8 @@ export function createOrchestrator(
       if (project) void refreshBranch(channel, project).catch(() => undefined);
       // Pick the default model FROM THE PROJECT'S BACKEND — a claude project must
       // not be handed codex's default ('gpt-5.5'). Unset backend → codex, as before.
-      const be = backendFor(project?.backend);
       const runtime = projectBackendRuntime(project);
+      const be = backendFor(runtime.backend);
       // ── 入站并行（M-1）── listModels+startThread（本地 spawn，实测 250ms–1.6s）
       // 与图片下载 / 文件+引用织入（飞书 API）互不依赖。任何一路失败都终止本轮
       // 并回 ❌（原先 ingest 失败只进日志、reaction 卡死——顺带修正），但已起的
@@ -1799,8 +1875,8 @@ export function createOrchestrator(
         // here. The resolved backend id rides the card state AND each pick
         // button's callback value (`b`), so the pick → readHistory → rebind path
         // stays on the same backend that listed the sessions.
-        const be = backendFor(project?.backend);
         const runtime = projectBackendRuntime(project);
+        const be = backendFor(runtime.backend);
         const threads = await be.listThreads(cwd, undefined, { env: runtime.env });
         const state: ResumeCardState = {
           chatId: msg.chatId,
@@ -1840,8 +1916,9 @@ export function createOrchestrator(
         // claude 项目的 /model 卡绝不能列 codex 模型——选中即经 patchSession
         // 持久化，重启 resume 会把 codex model id 喂给 claude CLI，会话坏死。
         const [rec, project] = await Promise.all([getSession(sessionKey), getProjectByChatId(msg.chatId)]);
-        const be = backendFor(rec?.backend ?? project?.backend);
-        const backendEnv = rec ? sessionBackendEnv(rec) : projectBackendRuntime(project).env;
+        const runtime = projectBackendRuntime(project);
+        const be = backendFor(rec?.backend ?? runtime.backend);
+        const backendEnv = rec ? sessionBackendEnv(rec) : runtime.env;
         const models = await listModels(be, backendEnv);
         // Seed the /model card's "current" from the project default (when this
         // topic has no session record yet) so a fresh topic shows what it WILL
@@ -2037,11 +2114,11 @@ export function createOrchestrator(
         const [rec, project] = await Promise.all([getSession(sessionKey), getProjectByChatId(msg.chatId)]);
         // Route by the session's backend (fall back to the project's) — a fresh
         // codex thread for a codex session, claude for a claude one.
-        const be = backendFor(rec?.backend ?? project?.backend);
         const cwd = rec?.cwd ?? project?.cwd ?? fallbackCwd;
         // /clear 创建全新的原生会话，因此采用项目“当前”profile；旧会话仍保留
         // 自己的环境快照，可从 /resume 列表按旧环境恢复。
         const runtime = projectBackendRuntime(project);
+        const be = backendFor(runtime.backend);
         // Carry the session's chosen model/effort into the new thread so /clear
         // resets the CONVERSATION, not the user's model pick. Tier (mode/network/
         // autoCompact) comes from the caller's live perm.
@@ -2110,7 +2187,7 @@ export function createOrchestrator(
     const noMention = project ? (project.noMention ?? defaultNoMention(project)) : true;
     // 按本群项目的后端能力裁剪命令清单：不支持的后端不列 /goal、/compact、/resume
     // （能力守卫会拒），避免「列了点了才发现不支持」。codex(capabilities undefined)=全列。
-    const caps = backendFor(project?.backend).capabilities;
+    const caps = backendFor(projectBackendId(project)).capabilities;
     await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       await sendManagedCard(channel, msg.chatId, buildHelpCard(scope, noMention, isAdmin(cfg, msg.senderId), caps), msg.messageId, inThread).catch((err) =>
         log.fail('card', err, { cmd: 'help', scope }),
@@ -2827,26 +2904,30 @@ export function createOrchestrator(
       if (dmAdmin(evt.operator?.openId)) freshMenu(evt);
     })
     .on(DM.newProject, ({ evt }) => {
-      if (dmAdmin(evt.operator?.openId)) patch(evt, buildNewProjectFormCard({ backends: backendOptionsFor('full') }));
+      if (dmAdmin(evt.operator?.openId)) {
+        patch(evt, buildNewProjectFormCard({ profiles: backendProfileOptionsFor(cfg) }));
+      }
     })
     .on(DM.newProjectSubmit, ({ evt, formValue, value }) => {
       const op = evt.operator?.openId;
       if (!dmAdmin(op)) return;
       const name = String((formValue?.name as string) ?? '').trim();
       const cwdIn = String((formValue?.cwd as string) ?? '').trim();
-      const backend = safeBackendId(formValue);
+      const backendProfileValue = selectValue(formValue, 'backendProfile');
       const kind: 'multi' | 'single' = value.kind === 'single' ? 'single' : 'multi';
-      const backends = backendOptionsFor('full');
+      const profiles = backendProfileOptionsFor(cfg);
       // A submitted form locks its card_id (its buttons — retry/返回 on an error
       // re-render — stop firing, and an in-place update no-ops). So the result
       // goes to a *fresh* card; the submitted form stays above as a 留痕. Detach
       // so the submit callback acks immediately (createProject is slow).
       void (async () => {
         let result;
-        if (!name) result = buildNewProjectFormCard({ cwd: cwdIn, error: '项目名不能为空', backends });
-        else if (!op) result = buildNewProjectFormCard({ name, cwd: cwdIn, error: '无法识别操作者身份', backends });
+        if (!name) result = buildNewProjectFormCard({ cwd: cwdIn, error: '项目名不能为空', profiles, backendProfile: backendProfileValue });
+        else if (!op) result = buildNewProjectFormCard({ name, cwd: cwdIn, error: '无法识别操作者身份', profiles, backendProfile: backendProfileValue });
         else {
           try {
+            const backendProfile = safeBackendProfileName(formValue, cfg);
+            const backend = backendForProfile(cfg, backendProfile);
             const p = await createProject(channel, {
               name,
               ownerOpenId: op,
@@ -2854,11 +2935,12 @@ export function createOrchestrator(
               projectsRootDir: cfg.preferences?.projectsRootDir,
               kind,
               backend,
+              backendProfile,
             });
-            log.info('console', 'new-project', { name: p.name, blank: p.blank, backend: p.backend });
-            result = buildNewProjectDoneCard(p);
+            log.info('console', 'new-project', { name: p.name, blank: p.blank, backend, profile: p.backendProfile });
+            result = buildNewProjectDoneCard(p, backendDisplayName(backend));
           } catch (err) {
-            result = buildNewProjectFormCard({ name, cwd: cwdIn, error: err instanceof Error ? err.message : String(err), backends });
+            result = buildNewProjectFormCard({ name, cwd: cwdIn, error: err instanceof Error ? err.message : String(err), profiles, backendProfile: backendProfileValue });
           }
         }
         await sendManagedCard(channel, evt.chatId, result).catch((e) =>
@@ -2872,22 +2954,24 @@ export function createOrchestrator(
       const name = String((formValue?.name as string) ?? '').trim();
       const cwdIn = String((formValue?.cwd as string) ?? '').trim();
       const chatId = typeof value.chatId === 'string' ? value.chatId : '';
-      const backend = safeBackendId(formValue);
+      const backendProfileValue = selectValue(formValue, 'backendProfile');
       const kind: 'multi' | 'single' = value.kind === 'single' ? 'single' : 'multi';
       // 列「全后端」（full 档过滤面 = 已下载的都列，含 claude 系）。默认仍是 codex（列表
       // 首项），绑定后按所选后端定档：codex→qa（外部群安全默认）、claude→full（见 bindModeFor）。
-      const backends = backendOptionsFor('full');
+      const profiles = backendProfileOptionsFor(cfg);
       // Same fresh-card pattern as DM.newProjectSubmit: a submitted form locks
       // its card_id, so the result goes to a new card while the form stays above
       // as a 留痕. Detached so the click acks immediately (join is slow).
       void (async () => {
         let result;
         if (!chatId)
-          result = buildJoinGroupFormCard({ chatId: '', name, cwd: cwdIn, error: '缺少群标识，请重新从进群通知里打开绑定卡', backends });
-        else if (!name) result = buildJoinGroupFormCard({ chatId, cwd: cwdIn, error: '项目名不能为空', backends });
-        else if (!op) result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, error: '无法识别操作者身份', backends });
+          result = buildJoinGroupFormCard({ chatId: '', name, cwd: cwdIn, error: '缺少群标识，请重新从进群通知里打开绑定卡', profiles, backendProfile: backendProfileValue });
+        else if (!name) result = buildJoinGroupFormCard({ chatId, cwd: cwdIn, error: '项目名不能为空', profiles, backendProfile: backendProfileValue });
+        else if (!op) result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, error: '无法识别操作者身份', profiles, backendProfile: backendProfileValue });
         else {
           try {
+            const backendProfile = safeBackendProfileName(formValue, cfg);
+            const backend = backendForProfile(cfg, backendProfile);
             const p = await joinExistingGroup(channel, {
               name,
               chatId,
@@ -2896,12 +2980,13 @@ export function createOrchestrator(
               projectsRootDir: cfg.preferences?.projectsRootDir,
               kind,
               backend,
+              backendProfile,
               mode: bindModeFor(backend),
             });
-            log.info('console', 'join-group', { name: p.name, blank: p.blank, backend: p.backend, mode: p.mode });
-            result = buildNewProjectDoneCard(p);
+            log.info('console', 'join-group', { name: p.name, blank: p.blank, backend, profile: p.backendProfile, mode: p.mode });
+            result = buildNewProjectDoneCard(p, backendDisplayName(backend));
           } catch (err) {
-            result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, error: err instanceof Error ? err.message : String(err), backends });
+            result = buildJoinGroupFormCard({ chatId, name, cwd: cwdIn, error: err instanceof Error ? err.message : String(err), profiles, backendProfile: backendProfileValue });
           }
         }
         await sendManagedCard(channel, evt.chatId, result).catch((e) =>
@@ -3541,7 +3626,7 @@ export function createOrchestrator(
       patch(evt, async () => {
         const project = await getProjectByChatId(evt.chatId);
         if (!project) return buildGroupSettingsCard({ name: '本群', kind: 'multi' });
-        const models = await listModels(backendFor(project.backend), projectBackendRuntime(project).env);
+        const models = await listModels(backendFor(projectBackendId(project)), projectBackendRuntime(project).env);
         return buildModelDefaultCard(project, models, 'group');
       });
     })
@@ -3552,7 +3637,7 @@ export function createOrchestrator(
       void (async () => {
         const project = await getProjectByChatId(evt.chatId);
         if (!project) return;
-        const models = await listModels(backendFor(project.backend), projectBackendRuntime(project).env);
+        const models = await listModels(backendFor(projectBackendId(project)), projectBackendRuntime(project).env);
         const m = modelId ? models.find((x) => x.id === modelId && !x.hidden) : undefined;
         if (m) {
           const supported = m.supportedEfforts ?? [];
@@ -3669,7 +3754,7 @@ export function createOrchestrator(
       const name = typeof value.n === 'string' ? value.n : '';
       patch(evt, async () => {
         const p = await getProjectByName(name);
-        return p ? buildProjectSettingsCard(p, backendDisplayName(p.backend)) : buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+        return p ? buildProjectSettingsCard(p, backendDisplayName(projectBackendId(p))) : buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
       });
     })
     .on(DM.projectTopics, ({ evt, value }) => {
@@ -3690,7 +3775,7 @@ export function createOrchestrator(
       patch(evt, async () => {
         const r = await performSetNoMention({ projectName: name, on });
         if (!r.ok) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
-        return buildProjectSettingsCard(r.project, backendDisplayName(r.project.backend));
+        return buildProjectSettingsCard(r.project, backendDisplayName(projectBackendId(r.project)));
       });
     })
     .on(DM.setAutoCompactDm, ({ evt, value }) => {
@@ -3703,7 +3788,7 @@ export function createOrchestrator(
         const r = await performSetAutoCompact({ projectName: name, on, evictLiveSessionsForChat });
         if (!r.ok) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
         log.info('console', 'project-autocompact', { project: name, on });
-        return buildProjectSettingsCard(r.project, backendDisplayName(r.project.backend));
+        return buildProjectSettingsCard(r.project, backendDisplayName(projectBackendId(r.project)));
       });
     })
     // 🔐 权限：打开下拉表单子卡（管理员档 + 普通用户档 + 联网，选完提交）。
@@ -3727,10 +3812,10 @@ export function createOrchestrator(
       void (async () => {
         // 共享层（admin/ops.ts）：落盘 + 驱逐活跃会话让新档立即生效；写后回读，
         // 卡片与盘上一致——与 Web 控制台的 setPermissionMode 完全同一条路径。
-        const r = await performSetPermissionMode({ projectName: name, mode, guestMode, network, evictLiveSessionsForChat });
+        const r = await performSetPermissionMode({ cfg, projectName: name, mode, guestMode, network, evictLiveSessionsForChat });
         if (!r.ok) return;
         log.info('console', 'permission', { project: name, mode, guestMode, network });
-        await sendManagedCard(channel, evt.chatId, buildProjectSettingsCard(r.project, backendDisplayName(r.project.backend))).catch((e) =>
+        await sendManagedCard(channel, evt.chatId, buildProjectSettingsCard(r.project, backendDisplayName(projectBackendId(r.project)))).catch((e) =>
           log.fail('console', e, { phase: 'permission-result' }),
         );
       })();
@@ -3742,7 +3827,7 @@ export function createOrchestrator(
       patch(evt, async () => {
         const p = await getProjectByName(name);
         if (!p) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
-        const models = await listModels(backendFor(p.backend), projectBackendRuntime(p).env);
+        const models = await listModels(backendFor(projectBackendId(p)), projectBackendRuntime(p).env);
         return buildModelDefaultCard(p, models, 'dm');
       });
     })
@@ -3757,7 +3842,7 @@ export function createOrchestrator(
       void (async () => {
         const p = await getProjectByName(name);
         if (!p) return;
-        const models = await listModels(backendFor(p.backend), projectBackendRuntime(p).env);
+        const models = await listModels(backendFor(projectBackendId(p)), projectBackendRuntime(p).env);
         const m = modelId ? models.find((x) => x.id === modelId && !x.hidden) : undefined;
         let notice: string;
         if (!m) {
@@ -3775,7 +3860,7 @@ export function createOrchestrator(
         await sendManagedCard(
           channel,
           evt.chatId,
-          buildProjectSettingsCard(fresh, backendDisplayName(fresh.backend), notice),
+          buildProjectSettingsCard(fresh, backendDisplayName(projectBackendId(fresh)), notice),
         ).catch((e) => log.fail('console', e, { phase: 'model-default-result' }));
       })();
     });
@@ -5192,7 +5277,11 @@ export function createOrchestrator(
       await sendManagedCard(
         channel,
         op,
-        buildJoinGroupFormCard({ chatId: evt.chatId, name, backends: backendOptionsFor('full') }),
+        buildJoinGroupFormCard({
+          chatId: evt.chatId,
+          name,
+          profiles: backendProfileOptionsFor(cfg),
+        }),
         undefined,
         false,
         'open_id',
@@ -5343,7 +5432,11 @@ export function createOrchestrator(
     try {
       switch (evt.eventKey) {
         case DM.newProject:
-          await sendDm(buildNewProjectFormCard({ backends: backendOptionsFor('full') }));
+          await sendDm(
+            buildNewProjectFormCard({
+              profiles: backendProfileOptionsFor(cfg),
+            }),
+          );
           break;
         case DM.projects:
           await sendDm(await renderProjectList());

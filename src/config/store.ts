@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import { paths } from './paths';
 import type { AppConfig, AppPreferences, TenantBrand } from './schema';
 import { secretKeyForApp } from './schema';
+import { initialBackendProfiles } from '../agent/profiles';
 
 export async function loadConfig(path: string = paths.configFile): Promise<Partial<AppConfig>> {
   try {
@@ -39,6 +40,7 @@ export async function buildEncryptedAccountConfig(
         bridge: { source: 'exec', command: wrapperPath, args: [] },
       },
     },
+    backendProfiles: initialBackendProfiles(),
     ...(preferences ? { preferences } : {}),
   };
 }

@@ -141,17 +141,18 @@ describe('performSetBackendProfile', () => {
   const cfg: AppConfig = {
     accounts: { app: { id: 'cli_test', secret: 'secret', tenant: 'feishu' } },
     backendProfiles: {
+      'codex/默认': { backend: 'codex-appserver', env: {} },
       work: { backend: 'codex-appserver', env: { CODEX_HOME: resolve(paths.appDir, 'codex-work') } },
     },
   };
 
-  it('已定义 profile 可写入项目，空值可恢复继承 daemon 环境', async () => {
+  it('已定义 profile 可写入项目，空值回到当前后端的默认 profile', async () => {
     const set = await performSetBackendProfile({ cfg, projectName: 'demo', profile: 'work' });
     expect(set.ok).toBe(true);
     expect((await getProjectByName('demo'))?.backendProfile).toBe('work');
     const clear = await performSetBackendProfile({ cfg, projectName: 'demo', profile: '' });
     expect(clear.ok).toBe(true);
-    expect((await getProjectByName('demo'))?.backendProfile).toBe('');
+    expect((await getProjectByName('demo'))?.backendProfile).toBe('codex/默认');
   });
 
   it('不存在的 profile 被拒绝且不落盘', async () => {

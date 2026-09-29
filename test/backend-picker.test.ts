@@ -5,9 +5,15 @@ import {
   buildProjectSettingsCard,
   type BackendProbeRow,
 } from '../src/card/dm-cards';
-import { probeBackends, validateBackendSwitch } from '../src/bot/handle-message';
+import {
+  backendProfileOptionsFor,
+  probeBackends,
+  safeBackendProfileName,
+  validateBackendSwitch,
+} from '../src/bot/handle-message';
 import { createBackend } from '../src/agent';
 import type { BackendProbe } from '../src/agent/types';
+import type { AppConfig } from '../src/config/schema';
 
 
 describe('probeBackends（并行 doctor + 单个超时兜底）', () => {
@@ -60,11 +66,11 @@ describe('probeBackends（并行 doctor + 单个超时兜底）', () => {
 describe('buildProjectSettingsCard 的 🧠 后端区块', () => {
   const base = { name: 'P', cwd: '/x', kind: 'multi' as const, origin: 'created' as const };
 
-  it('只读显示当前后端（缺省 = codex-appserver）+ 创建时锁定，不再有切换按钮', () => {
+  it('显示当前后端与 profile，并说明 profile 是路由入口', () => {
     const json = JSON.stringify(buildProjectSettingsCard(base));
     expect(json).toContain('🧠 后端');
     expect(json).toContain('codex-appserver'); // 缺省回退到默认 id
-    expect(json).toContain('新建项目时选定'); // 锁定文案
+    expect(json).toContain('Profile 同时决定后端与运行环境');
     // 去切换：后端区块不再有「打开后端选择卡」的按钮（旧 dm.proj.backend 入口已删）
     expect(json).not.toContain('dm.proj.backend');
   });
@@ -84,39 +90,69 @@ describe('buildProjectSettingsCard 的 🧠 后端区块', () => {
   });
 });
 
-describe('buildNewProjectFormCard 的后端选择（创建时选定）', () => {
-  // codex-only 现实：「可选后端」只有 codex 一个。下面单后端用例即默认主路径。
-  const codexOnly = [{ label: 'Codex App Server', value: 'codex-appserver' }];
-
-  it('仅一个可选后端（codex）→ 不出下拉，改静态文案显示默认后端名（默认主路径）', () => {
-    const json = JSON.stringify(buildNewProjectFormCard({ backends: codexOnly }));
-    expect(json).not.toContain('select_static');
-    expect(json).toContain('Codex App Server');
-  });
-
-  it('多个可选后端 → 渲染 select_static 下拉（name=backend，预选第一个 codex）+ 固定文案', () => {
-    // 渲染分支保留（backends.length > 1 走下拉），用一个泛化第二项触发，不引用已删后端。
-    const multi = [...codexOnly, { label: '其它后端', value: 'other-backend' }];
-    const json = JSON.stringify(buildNewProjectFormCard({ backends: multi }));
-    expect(json).toContain('select_static');
-    expect(json).toContain('other-backend');
-    expect(json).toContain('固定不可切换');
-    // 预选第一个（codex）
-    expect(json).toContain('"initial_option":"codex-appserver"');
-  });
-
-  it('未传 backends → 不渲染后端选择块（向后兼容）', () => {
+describe('buildNewProjectFormCard 的后端 Profile 选择', () => {
+  it('未传 profiles → 不渲染 Profile 下拉', () => {
     const json = JSON.stringify(buildNewProjectFormCard({}));
     expect(json).not.toContain('select_static');
-    expect(json).not.toContain('后端 Agent');
+    expect(json).not.toContain('backendProfile');
   });
 
-  it('完成卡显示选定后端（按 id 解析展示名；缺省回退默认 codex 名）', () => {
+  it('渲染单一 backendProfile 下拉，并预选第一个默认 Profile', () => {
+    const profiles = [
+      { label: 'Codex / codex/默认', value: 'profile:codex/默认' },
+      { label: 'Codex / personal · C:/Users/u/.codex-personal', value: 'profile:personal' },
+      { label: 'Claude / claude/默认', value: 'profile:claude/默认' },
+    ];
+    const json = JSON.stringify(buildNewProjectFormCard({ profiles }));
+    expect(json).toContain('"name":"backendProfile"');
+    expect(json).not.toContain('"name":"backend"');
+    expect(json).toContain('profile:personal');
+    expect(json).toContain('profile:claude/默认');
+    expect(json).toContain('"initial_option":"profile:codex/默认"');
+  });
+
+  it('完成卡显示解析后的后端与 Profile', () => {
     const done = JSON.stringify(
-      buildNewProjectDoneCard({ name: 'P', cwd: '/x', kind: 'multi', origin: 'created', backend: 'codex-appserver' } as never),
+      buildNewProjectDoneCard(
+        { name: 'P', cwd: '/x', kind: 'multi', origin: 'created', backendProfile: 'personal' } as never,
+        'Codex',
+      ),
     );
     expect(done).toContain('🧠');
-    expect(done).toContain('Codex'); // codex-appserver 的展示名 = Codex
+    expect(done).toContain('Codex');
+    expect(done).toContain('personal');
+  });
+});
+
+describe('新建项目 backend profile 选项与提交校验', () => {
+  const cfg: Pick<AppConfig, 'backendProfiles'> = {
+    backendProfiles: {
+      'codex/默认': { backend: 'codex-appserver', env: {} },
+      'claude/默认': { backend: 'claude-agent', env: {} },
+      personal: {
+        backend: 'codex-appserver',
+        env: { CODEX_HOME: 'C:/Users/u/.codex-personal', HTTPS_PROXY: 'http://user:secret@proxy' },
+      },
+    },
+  };
+
+  it('选项只展示 profile、后端和 CODEX_HOME，不泄露其它环境变量', () => {
+    const json = JSON.stringify(backendProfileOptionsFor(cfg));
+    expect(json).toContain('profile:personal');
+    expect(json).toContain('C:/Users/u/.codex-personal');
+    expect(json).not.toContain('HTTPS_PROXY');
+    expect(json).not.toContain('secret');
+  });
+
+  it('命名项返回并校验真实 profile', () => {
+    expect(safeBackendProfileName({ backendProfile: 'profile:personal' }, cfg)).toBe('personal');
+    expect(safeBackendProfileName({ backendProfile: 'profile:claude/默认' }, cfg)).toBe('claude/默认');
+  });
+
+  it('拒绝未选、伪造或缺失的 profile', () => {
+    expect(() => safeBackendProfileName({}, cfg)).toThrow(/请选择/);
+    expect(() => safeBackendProfileName({ backendProfile: 'personal' }, cfg)).toThrow(/无效/);
+    expect(() => safeBackendProfileName({ backendProfile: 'profile:missing' }, cfg)).toThrow(/不存在/);
   });
 });
 

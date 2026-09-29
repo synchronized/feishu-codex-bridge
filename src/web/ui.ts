@@ -2332,7 +2332,7 @@ ${UI_PURE_JS}
     d.appendChild(el('div', 'note', '命名配置用于选择 CODEX_HOME 等运行环境，只影响新会话；既有话题继续使用创建时的环境快照。'));
     var profileBtn = el('button', 'btn secondary', p.backendProfile ? '更改命名配置' : '选择命名配置');
     profileBtn.onclick = function () {
-      var value = window.prompt('输入 config.json 中 backendProfiles 的名称；留空表示继承 daemon 环境。', p.backendProfile || '');
+      var value = window.prompt('输入 config.json 中 backendProfiles 的名称；留空表示使用当前后端的默认 Profile。', p.backendProfile || '');
       if (value === null) return;
       postWrite('/api/project/' + encodeURIComponent(p.name) + '/backend-profile', { profile: value.trim() });
     };

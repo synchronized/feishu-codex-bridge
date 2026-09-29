@@ -3,6 +3,48 @@ import { isAbsolute, resolve } from 'node:path';
 import type { AppConfig, BackendProfileConfig } from '../config/schema';
 import type { BackendEnvironment } from './types';
 
+export const DEFAULT_CODEX_PROFILE = 'codex/默认';
+export const DEFAULT_CLAUDE_PROFILE = 'claude/默认';
+
+/** 新机器人初始化时自带的 profile。空 env 表示继承 Bridge 进程环境。 */
+export function initialBackendProfiles(): NonNullable<AppConfig['backendProfiles']> {
+  return {
+    [DEFAULT_CODEX_PROFILE]: { backend: 'codex-appserver', env: {} },
+    [DEFAULT_CLAUDE_PROFILE]: { backend: 'claude-agent', env: {} },
+  };
+}
+
+/** 为旧配置补齐内置默认 profile；保留用户已有的同名配置。 */
+export function ensureDefaultBackendProfiles(cfg: AppConfig): boolean {
+  const current = (cfg.backendProfiles ??= {});
+  let changed = false;
+  for (const [name, profile] of Object.entries(initialBackendProfiles())) {
+    if (current[name]) continue;
+    current[name] = profile;
+    changed = true;
+  }
+  return changed;
+}
+
+/** 已知 backend 对应的默认 profile；未来后端回落到 `<backend>/默认`。 */
+export function defaultProfileForBackend(backend: string): string {
+  if (backend === 'codex-appserver') return DEFAULT_CODEX_PROFILE;
+  if (backend === 'claude-agent') return DEFAULT_CLAUDE_PROFILE;
+  return `${backend}/默认`;
+}
+
+/** profile 是项目路由的单一真源：由 profile 解析 backend id。 */
+export function backendForProfile(
+  cfg: Pick<AppConfig, 'backendProfiles'>,
+  name: string | undefined,
+  legacyBackend = 'codex-appserver',
+): string {
+  if (!name?.trim()) return legacyBackend;
+  const profile = cfg.backendProfiles?.[name.trim()];
+  if (!profile) throw new Error(`后端配置「${name.trim()}」不存在（请检查 config.json 的 backendProfiles）`);
+  return profile.backend;
+}
+
 /** config.json 可明文保存的后端环境变量。刻意不接受任何 token / API Key。 */
 export const BACKEND_PROFILE_ENV_KEYS = [
   'CODEX_HOME',
@@ -50,7 +92,7 @@ export function resolveBackendProfile(
     }
     out[key] = value;
   }
-  return out;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** 稳定序列化，用作 Codex utility / 预热池的隔离键。 */

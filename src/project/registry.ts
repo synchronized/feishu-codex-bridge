@@ -3,6 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { paths } from '../config/paths';
 import type { PermissionMode, ReasoningEffort } from '../agent/types';
+import { DEFAULT_BACKEND_ID } from '../agent/types';
+import { defaultProfileForBackend } from '../agent/profiles';
+import type { AppConfig } from '../config/schema';
 
 /** A project = a Feishu group bound to a fixed working directory. */
 export interface Project {
@@ -50,14 +53,15 @@ export interface Project {
    * bridge pushes codex's auto-compact token limit past any real usage to disable
    * it (see backend sandboxParams / AUTO_COMPACT_OFF_LIMIT). */
   autoCompact?: boolean;
-  /** agent backend id for this project (see src/agent/index.ts registry).
+  /** 旧数据兼容字段。新项目只写 backendProfile，运行时从 profile 派生 backend。
+   * agent backend id for this project (see src/agent/index.ts registry).
    * Omitted on old/normal data → the codex default (DEFAULT_BACKEND_ID — historical path,
    * zero behavior change). Routed per project in createOrchestrator's
    * backendFor(). Set via the DM 项目设置卡的「🧠 后端」picker（校验见
    * validateBackendSwitch）；只影响新话题——已有话题会话按 SessionRecord.backend
    * 仍走原后端. */
   backend?: string;
-  /** config.json 中 backendProfiles 的名称。缺省时后端继承 daemon 环境。 */
+  /** config.json 中 backendProfiles 的名称；新项目路由的单一真源。 */
   backendProfile?: string;
   /** 本项目**新话题**的默认模型 id。优先级在 per-session `/model` 覆盖之下、后端自带
    * 默认之上。跟项目 backend 走（创建时固定）；读取时经 {@link pickDefault} 对后端的
@@ -172,6 +176,43 @@ async function write(projects: Project[]): Promise<void> {
 
 export async function listProjects(): Promise<Project[]> {
   return read();
+}
+
+/**
+ * 旧项目迁移到 profile-only：已有命名 profile 原样保留并移除冗余 backend；只有
+ * backend 的项目映射到该后端的默认 profile。找不到可用 profile 时保持旧字段不动。
+ */
+export function migrateProjectsToBackendProfiles(cfg: Pick<AppConfig, 'backendProfiles'>): Promise<number> {
+  return withLock(async () => {
+    const projects = await read();
+    const migrated = migrateProjectRecordsToBackendProfiles(projects, cfg);
+    if (migrated.changed > 0) await write(migrated.projects);
+    return migrated.changed;
+  });
+}
+
+/** 纯迁移核心，供启动迁移与回归测试共用。 */
+export function migrateProjectRecordsToBackendProfiles(
+  projects: Project[],
+  cfg: Pick<AppConfig, 'backendProfiles'>,
+): { projects: Project[]; changed: number } {
+  let changed = 0;
+  const next = projects.map((project) => {
+      const profileName = project.backendProfile?.trim();
+      if (profileName && cfg.backendProfiles?.[profileName]) {
+        if (!project.backend) return project;
+        const { backend: _legacy, ...rest } = project;
+        changed++;
+        return rest;
+      }
+      const backend = project.backend ?? DEFAULT_BACKEND_ID;
+      const fallbackProfile = defaultProfileForBackend(backend);
+      if (!cfg.backendProfiles?.[fallbackProfile]) return project;
+      const { backend: _legacy, ...rest } = project;
+      changed++;
+      return { ...rest, backendProfile: fallbackProfile };
+  });
+  return { projects: next, changed };
 }
 
 export async function getProjectByChatId(chatId: string): Promise<Project | undefined> {

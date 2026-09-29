@@ -631,29 +631,35 @@ export function buildDoctorCard(i: DoctorInfo): CardObject {
 }
 
 /**
- * Interactive new-project form: project name + optional CWD + **backend picker**
- * + submit/cancel. The backend is chosen here, at creation, and fixed afterwards
- * (no switching). `backends` lists only the downloaded + permission-compatible
- * options (computed by the handler via {@link projectCreatableBackends}); when
- * just one (codex baseline), it's shown as a static note instead of a dropdown.
+ * Interactive new-project form: project name + optional CWD + **backend profile
+ * picker** + submit/cancel. Profile 同时决定 backend 与运行环境，项目不再分别保存二者。
  */
 export function buildNewProjectFormCard(
-  opts: { name?: string; cwd?: string; error?: string; backends?: SelectOption[] } = {},
+  opts: {
+    name?: string;
+    cwd?: string;
+    error?: string;
+    profiles?: SelectOption[];
+    backendProfile?: string;
+  } = {},
 ): CardObject {
   const elements = [];
   if (opts.error) elements.push(md(`❌ **创建失败**：${opts.error}`));
-  const backends = opts.backends ?? [];
   const formItems: CardElement[] = [
     input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
     input({ name: 'cwd', label: '文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
   ];
-  if (backends.length > 1) {
+  const profiles = opts.profiles ?? [];
+  if (profiles.length > 0) {
     formItems.push(
-      note('🧠 后端 Agent（创建后**固定不可切换**；标注「未下载」的需先去 Web「后端 Agent」页下载，选它会提示）'),
-      selectMenu({ name: 'backend', placeholder: '选择后端 Agent', options: backends, initial: backends[0]?.value }),
+      note('🧠 后端 Profile（同时决定后端与 CODEX_HOME 等运行环境；创建后可换 profile，但只影响新会话）'),
+      selectMenu({
+        name: 'backendProfile',
+        placeholder: '选择后端配置',
+        options: profiles,
+        initial: opts.backendProfile ?? profiles[0]?.value,
+      }),
     );
-  } else if (backends.length === 1) {
-    formItems.push(note(`🧠 后端 Agent：**${backends[0]!.label}**（创建后固定）`));
   }
   formItems.push(
     note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话；💬 单会话群 = 整群一个会话、连续上下文。'),
@@ -678,22 +684,32 @@ export function buildNewProjectFormCard(
  * handler binds *this* group instead of creating a new one.
  */
 export function buildJoinGroupFormCard(
-  opts: { chatId: string; name?: string; cwd?: string; error?: string; backends?: SelectOption[] },
+  opts: {
+    chatId: string;
+    name?: string;
+    cwd?: string;
+    error?: string;
+    profiles?: SelectOption[];
+    backendProfile?: string;
+  },
 ): CardObject {
   const elements: CardElement[] = [];
   if (opts.error) elements.push(md(`❌ **绑定失败**：${opts.error}`));
-  const backends = opts.backends ?? [];
   const formItems: CardElement[] = [
     input({ name: 'name', label: '项目名', placeholder: 'my-app', value: opts.name, required: true }),
     input({ name: 'cwd', label: '文件夹路径（选填，留空自动新建）', placeholder: '/Users/you/code/my-app', value: opts.cwd }),
   ];
-  if (backends.length > 1) {
+  const profiles = opts.profiles ?? [];
+  if (profiles.length > 0) {
     formItems.push(
-      note('🧠 后端 Agent（绑定后**固定不可切换**）。默认 **Codex** 以「只读」档绑定（外部群安全）。'),
-      selectMenu({ name: 'backend', placeholder: '选择后端 Agent', options: backends, initial: backends[0]?.value }),
+      note('🧠 后端 Profile（同时决定后端与 CODEX_HOME 等运行环境；已有会话不受影响）'),
+      selectMenu({
+        name: 'backendProfile',
+        placeholder: '选择后端配置',
+        options: profiles,
+        initial: opts.backendProfile ?? profiles[0]?.value,
+      }),
     );
-  } else if (backends.length === 1) {
-    formItems.push(note(`🧠 后端 Agent：**${backends[0]!.label}**（绑定后固定）`));
   }
   formItems.push(
     note('选群类型(直接点对应按钮创建)：👥 多话题群 = @我开话题、每话题独立会话；💬 单会话群 = 整群一个会话、连续上下文（默认不免@）。'),
@@ -713,14 +729,14 @@ export function buildJoinGroupFormCard(
 /** Shown after a project is created/bound — a terminal "留痕" record with a
  * jump-to-group button so the admin can hop straight into the group and start
  * working. (Re-open the console any time by messaging the bot.) */
-export function buildNewProjectDoneCard(p: Project): CardObject {
+export function buildNewProjectDoneCard(p: Project, resolvedBackendName?: string): CardObject {
   const joined = (p.origin ?? 'created') === 'joined';
   const verb = joined ? '已绑定群' : '已创建项目';
   const title = joined ? '🔗 绑定已有群' : '➕ 新建项目';
-  const backendName = catalogById(p.backend ?? DEFAULT_BACKEND_ID)?.displayName ?? p.backend ?? DEFAULT_BACKEND_ID;
+  const backendName = resolvedBackendName ?? catalogById(p.backend ?? DEFAULT_BACKEND_ID)?.displayName ?? p.backend ?? DEFAULT_BACKEND_ID;
   const elements: CardElement[] = [
     md(`✅ ${verb} **${p.name}**${p.blank ? ' _(空白项目)_' : ''}`),
-    note(`📂 \`${p.cwd}\`   ·   ${kindLabel(p.kind)}   ·   🧠 ${backendName}`),
+    note(`📂 \`${p.cwd}\`   ·   ${kindLabel(p.kind)}   ·   🧠 ${backendName} / ${p.backendProfile ?? 'legacy'}`),
     md(p.chatId ? '👉 去群里 **@我** 干活。' : '发我任意消息可再次打开管理台。'),
   ];
   if (p.chatId)
@@ -1827,7 +1843,7 @@ export function buildProjectSettingsCard(
       hr(),
       md('🧠 后端'),
       note(
-        `当前 ${backendName ?? project.backend ?? DEFAULT_BACKEND_ID}${project.backendProfile ? ` · 配置 ${project.backendProfile}` : ''} 🔒　·　后端在**新建项目时选定**，运行时固定；命名配置只影响新会话。`,
+        `当前 ${backendName ?? project.backend ?? DEFAULT_BACKEND_ID} / ${project.backendProfile ?? 'legacy'}　·　Profile 同时决定后端与运行环境；调整只影响新会话。`,
       ),
       hr(),
       md('✋ 免@（不用 @ 也回复）'),

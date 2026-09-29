@@ -167,17 +167,26 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
     kind: input.kind ?? 'multi',
     origin: 'created',
     mode: input.mode ?? 'full',
-    backend: input.backend || undefined,
+    ...(input.backendProfile ? {} : { backend: input.backend || undefined }),
     backendProfile: input.backendProfile || undefined,
     network: input.network ?? false,
   };
   await addProject(project);
-  log.info('project', 'create', { name, chatId, cwd, blank, mode: project.mode, backend: project.backend });
+  log.info('project', 'create', {
+    name,
+    chatId,
+    cwd,
+    blank,
+    mode: project.mode,
+    backend: input.backend,
+    profile: project.backendProfile,
+  });
 
   // 4. group announcement (top banner) + onboarding (welcome card / Pin / tab),
   //    both best-effort — a group is usable even if these fail.
-  await setAnnouncement(channel, project).catch((err) => log.fail('project', err, { phase: 'announcement' }));
-  await onboardGroup(channel, project).catch((err) => log.fail('project', err, { phase: 'onboard' }));
+  const runtimeProject = input.backend ? { ...project, backend: input.backend } : project;
+  await setAnnouncement(channel, runtimeProject).catch((err) => log.fail('project', err, { phase: 'announcement' }));
+  await onboardGroup(channel, runtimeProject).catch((err) => log.fail('project', err, { phase: 'onboard' }));
   return project;
 }
 
@@ -210,15 +219,25 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
     origin: 'joined',
     addedBy: input.addedBy,
     mode: input.mode ?? 'qa',
-    backend: input.backend || undefined,
+    ...(input.backendProfile ? {} : { backend: input.backend || undefined }),
     backendProfile: input.backendProfile || undefined,
     network: input.network ?? false,
   };
   await addProject(project);
-  log.info('project', 'join', { name, chatId: input.chatId, cwd, blank, kind: project.kind, mode: project.mode, backend: project.backend });
+  log.info('project', 'join', {
+    name,
+    chatId: input.chatId,
+    cwd,
+    blank,
+    kind: project.kind,
+    mode: project.mode,
+    backend: input.backend,
+    profile: project.backendProfile,
+  });
 
   // Onboarding only (no announcement / Pin / tab — see onboardGroup's joined
   // branch); best-effort, the binding holds even if the welcome card fails.
-  await onboardGroup(channel, project).catch((err) => log.fail('project', err, { phase: 'onboard-join' }));
+  const runtimeProject = input.backend ? { ...project, backend: input.backend } : project;
+  await onboardGroup(channel, runtimeProject).catch((err) => log.fail('project', err, { phase: 'onboard-join' }));
   return project;
 }

@@ -46,6 +46,7 @@ import {
   type InstallResult,
   type InstallProgress,
 } from '../agent';
+import { backendForProfile } from '../agent/profiles';
 import type { BackendDepState, BackendProbe, PermissionMode } from '../agent/types';
 import { readRecentLogs } from '../core/logger';
 import { getServiceAdapter } from '../service/adapter';
@@ -464,7 +465,10 @@ export interface AdminServiceDeps {
 export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
   async function projectsWithCounts(botId: string): Promise<AdminProject[]> {
     const files = botPaths(botId);
-    const projects = await listProjectsIn(files.projectsFile);
+    const [projects, rawCfg] = await Promise.all([
+      listProjectsIn(files.projectsFile),
+      loadConfig(files.configFile).catch(() => ({})),
+    ]);
     const sessions = await listSessionsIn(files.sessionsFile);
     // 未显式选后端的项目，effective backend = 智能默认（与运行时 backendForProject
     // 同源），UI 展示「会实际路由到哪」而非硬编码 codex；探测失败回退常量默认。
@@ -486,7 +490,13 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       mode: effectiveMode(p),
       guestMode: effectiveGuestMode(p),
       network: p.network ?? false,
-      backend: p.backend ?? defaultBackend,
+      backend: (() => {
+        try {
+          return backendForProfile(rawCfg, p.backendProfile, p.backend ?? defaultBackend);
+        } catch {
+          return p.backend ?? defaultBackend;
+        }
+      })(),
       backendProfile: p.backendProfile,
       allowedUsersCount: p.allowedUsers?.length ?? 0,
       sessionCount: p.chatId ? (countByChat.get(p.chatId) ?? 0) : 0,

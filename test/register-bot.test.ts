@@ -124,6 +124,9 @@ describe('registerBotFromCredentials · 注册落盘', () => {
     const cfgRaw = readFileSync(botPaths('cli_alpha12345').configFile, 'utf8');
     expect(cfgRaw).not.toContain('super-secret-value');
     expect(cfgRaw).toContain('exec');
+    const cfg = JSON.parse(cfgRaw);
+    expect(cfg.backendProfiles['codex/默认']).toEqual({ backend: 'codex-appserver', env: {} });
+    expect(cfg.backendProfiles['claude/默认']).toEqual({ backend: 'claude-agent', env: {} });
 
     // 注册表 + 唯一短名
     const reg = await loadBots();
