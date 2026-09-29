@@ -420,6 +420,20 @@ export function backendProfileOptionsFor(
 }
 
 /**
+ * 旧版会话没有 profile/env 快照。只有其后端仍与项目当前 Profile 一致时，才在
+ * 首次恢复时采用项目 Profile；已有任一快照字段的会话必须继续保持原运行环境。
+ */
+export function shouldAdoptProjectProfile(
+  session: Pick<SessionRecord, 'backend' | 'backendProfile' | 'backendEnv'>,
+  projectRuntime: { backend: string; profile?: string } | undefined,
+): boolean {
+  return session.backendProfile === undefined
+    && session.backendEnv === undefined
+    && projectRuntime?.profile !== undefined
+    && session.backend === projectRuntime.backend;
+}
+
+/**
  * 收口卡片提交的命名配置，并校验它真实存在且属于所选后端。编码前缀避免名为
  * `inherit` 的合法 profile 与“继承环境”选项冲突。
  */
@@ -769,6 +783,23 @@ export function createOrchestrator(
   /** 会话优先使用创建时持久化的环境快照；只有较早的过渡记录才按 profile 名回查。 */
   function sessionBackendEnv(rec: SessionRecord): BackendEnvironment | undefined {
     return rec.backendEnv ?? resolveBackendProfile(cfg, rec.backendProfile, rec.backend);
+  }
+
+  /** 旧会话首次恢复时补齐项目 Profile；已有快照的会话仍严格使用创建时环境。 */
+  function sessionBackendRuntime(
+    rec: SessionRecord,
+    project: Project | undefined,
+  ): { backend: string; profile?: string; env?: BackendEnvironment; adopted: boolean } {
+    const current = project ? projectBackendRuntime(project) : undefined;
+    if (shouldAdoptProjectProfile(rec, current)) {
+      return { ...current!, adopted: true };
+    }
+    return {
+      backend: rec.backend,
+      profile: rec.backendProfile,
+      env: sessionBackendEnv(rec),
+      adopted: false,
+    };
   }
 
   /** Snapshot the selected backend's title policy when its native session is
@@ -1568,9 +1599,10 @@ export function createOrchestrator(
         } else if (recreated) {
           // resume 失败后创建的是一个全新的 HOST 会话；它属于升级后的新会话，
           // 应独立登记标题任务（旧 sessionId 的 ledger/标题绝不复用）。
-          const be = backendFor(prior?.backend ?? projectBackendId(project));
+          const runtime = prior ? sessionBackendRuntime(prior, project) : projectBackendRuntime(project);
+          const be = backendFor(runtime.backend);
           const cwd = project?.cwd ?? prior?.cwd ?? fallbackCwd;
-          const backendEnv = prior ? sessionBackendEnv(prior) : projectBackendRuntime(project).env;
+          const backendEnv = runtime.env;
           titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource, backendEnv);
           // Full replacement drops the old session's titleJobKey even if title
           // registration failed; carrying it across would let a later turn attach
@@ -1581,6 +1613,8 @@ export function createOrchestrator(
               cwd,
               sessionId: thread.sessionId,
               backend: be.id,
+              backendProfile: runtime.profile,
+              backendEnv: runtime.env,
               ...(titleJobKey ? { titleJobKey } : { titleJobKey: undefined }),
               updatedAt: Date.now(),
             });
@@ -1687,8 +1721,23 @@ export function createOrchestrator(
     // later must not strand existing sessions on the wrong runtime; the project
     // is still consulted for cwd / tier defaults on the recreate path below.
     const project = await getProjectByChatId(chatId);
-    const be = backendFor(rec.backend);
-    const backendEnv = sessionBackendEnv(rec);
+    const runtime = sessionBackendRuntime(rec, project);
+    const be = backendFor(runtime.backend);
+    const backendEnv = runtime.env;
+    if (runtime.adopted) {
+      rec.backendProfile = runtime.profile;
+      rec.backendEnv = runtime.env;
+      await patchSession(threadId, {
+        backendProfile: runtime.profile,
+        backendEnv: runtime.env,
+      });
+      log.info('agent', 'session-profile-adopt', {
+        threadId,
+        backend: runtime.backend,
+        project: project?.name ?? 'unbound',
+        profile: runtime.profile,
+      });
+    }
     try {
       const resumed = await be.resumeThread({
         cwd: rec.cwd,
@@ -1708,7 +1757,7 @@ export function createOrchestrator(
         sessionId: rec.sessionId,
         backend: be.id,
         project: project?.name ?? 'unbound',
-        profile: rec.backendProfile ?? 'default',
+        profile: runtime.profile ?? 'default',
       });
       return { thread: resumed, recreated: false };
     } catch (err) {
@@ -1733,7 +1782,7 @@ export function createOrchestrator(
         sessionId: fresh.sessionId,
         backend: be.id,
         project: project?.name ?? 'unbound',
-        profile: rec.backendProfile ?? 'default',
+        profile: runtime.profile ?? 'default',
       });
       return { thread: fresh, recreated: true };
     }
