@@ -100,6 +100,8 @@ export interface AdminService {
   getProject(botId: string, name: string): Promise<AdminProject | undefined>;
   /** 🧠 切换项目后端（写）。与 DM dm.proj.backend.submit 同一套校验+落盘。 */
   switchBackend(botId: string, projectName: string, backendId: string): Promise<void>;
+  /** 为项目选择命名后端配置；空值恢复继承 daemon 环境。 */
+  setBackendProfile(botId: string, projectName: string, profile?: string): Promise<void>;
   /** 🔐 设置权限档（管理员档/普通用户档/联网）（写），含驱逐活跃会话的既有语义。 */
   setPermissionMode(
     botId: string,
@@ -294,6 +296,8 @@ export interface AdminProject {
   network: boolean;
   /** effective 后端 id（显式 backend ?? 智能默认 effectiveDefaultBackend，与运行时路由同源） */
   backend: string;
+  /** 新会话使用的命名后端配置；缺省表示继承 daemon 环境。 */
+  backendProfile?: string;
   allowedUsersCount: number;
   /** 🧵 话题数（该群名下的会话记录数） */
   sessionCount: number;
@@ -483,6 +487,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       guestMode: effectiveGuestMode(p),
       network: p.network ?? false,
       backend: p.backend ?? defaultBackend,
+      backendProfile: p.backendProfile,
       allowedUsersCount: p.allowedUsers?.length ?? 0,
       sessionCount: p.chatId ? (countByChat.get(p.chatId) ?? 0) : 0,
       createdAt: p.createdAt,
@@ -559,6 +564,10 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
 
     async switchBackend(botId: string, projectName: string, backendId: string): Promise<void> {
       await executeWrite(botId, '🧠 切换后端', { kind: 'switchBackend', project: projectName, backend: backendId });
+    },
+
+    async setBackendProfile(botId: string, projectName: string, profile?: string): Promise<void> {
+      await executeWrite(botId, '🧠 设置后端配置', { kind: 'setBackendProfile', project: projectName, profile });
     },
 
     async setPermissionMode(

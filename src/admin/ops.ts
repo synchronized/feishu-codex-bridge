@@ -1,4 +1,5 @@
 import { backendIds } from '../agent';
+import { resolveBackendProfile } from '../agent/profiles';
 import { catalogById } from '../agent/catalog';
 import type { AgentBackend, BackendProbe, PermissionMode, ReasoningEffort } from '../agent/types';
 import { tierLabel, type BackendProbeRow } from '../card/dm-cards';
@@ -38,6 +39,7 @@ import {
 /** Web/IPC 写操作的序列化形态（supervisor → bot 子进程经 process.send 转发）。 */
 export type AdminWriteOp =
   | { kind: 'switchBackend'; project: string; backend: string }
+  | { kind: 'setBackendProfile'; project: string; profile?: string }
   | {
       kind: 'setPermissionMode';
       project: string;
@@ -218,6 +220,27 @@ export async function performBackendSwitch(opts: {
   return { ok: true, project: await freshOr(opts.projectName, { ...p, backend: opts.target }) };
 }
 
+/** 为项目选择命名后端配置。只影响后续创建/手动恢复的会话；既有会话持有环境
+ * 快照，不会被换账号。空名称表示回到 daemon 环境。 */
+export async function performSetBackendProfile(opts: {
+  cfg: AppConfig;
+  projectName: string;
+  profile?: string;
+}): Promise<AdminWriteOutcome> {
+  const p = await getProjectByName(opts.projectName);
+  if (!p) return { ok: false, reason: `项目「${opts.projectName}」不存在` };
+  const profile = opts.profile?.trim() ?? '';
+  if (profile) {
+    try {
+      resolveBackendProfile(opts.cfg, profile, p.backend ?? 'codex-appserver');
+    } catch (err) {
+      return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    }
+  }
+  await updateProject(opts.projectName, { backendProfile: profile });
+  return { ok: true, project: await freshOr(opts.projectName, { ...p, backendProfile: profile }) };
+}
+
 /**
  * 🔐 设置权限档（DM dm.proj.perm.submit 与 Web setPermissionMode 同源）：落盘
  * 管理员档 mode / 普通用户档 guestMode / 联网，再驱逐本项目活跃会话让新档立即
@@ -378,6 +401,9 @@ export async function runAdminWriteOp(
   switch (op.kind) {
     case 'switchBackend':
       return performBackendSwitch({ projectName: op.project, target: op.backend, backendFor: deps.backendFor });
+    case 'setBackendProfile':
+      if (!deps.cfg) return { ok: false, reason: 'bot 运行配置不可用，无法设置后端配置' };
+      return performSetBackendProfile({ cfg: deps.cfg, projectName: op.project, profile: op.profile });
     case 'setPermissionMode':
       return performSetPermissionMode({
         projectName: op.project,

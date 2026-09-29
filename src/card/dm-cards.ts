@@ -1806,6 +1806,7 @@ export function buildProjectSettingsCard(
     | 'network'
     | 'autoCompact'
     | 'backend'
+    | 'backendProfile'
     | 'defaultModel'
     | 'defaultEffort'
   >,
@@ -1826,7 +1827,7 @@ export function buildProjectSettingsCard(
       hr(),
       md('🧠 后端'),
       note(
-        `当前 ${backendName ?? project.backend ?? DEFAULT_BACKEND_ID} 🔒　·　后端在**新建项目时选定**，运行时固定、不支持切换。如需更改，请删除该项目后用新后端重新创建。`,
+        `当前 ${backendName ?? project.backend ?? DEFAULT_BACKEND_ID}${project.backendProfile ? ` · 配置 ${project.backendProfile}` : ''} 🔒　·　后端在**新建项目时选定**，运行时固定；命名配置只影响新会话。`,
       ),
       hr(),
       md('✋ 免@（不用 @ 也回复）'),

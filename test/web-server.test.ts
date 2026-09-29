@@ -52,6 +52,9 @@ function stubService(): AdminService {
     async switchBackend() {
       throw new NotWiredYetError('🧠 切换后端');
     },
+    async setBackendProfile() {
+      throw new NotWiredYetError('🧠 设置后端配置');
+    },
     async setPermissionMode() {
       throw new NotWiredYetError('🔐 设置权限档');
     },
@@ -378,7 +381,7 @@ describe('web server · 只读 API', () => {
 });
 
 describe('web server · 写操作占位（只读预览：daemon 未跑）', () => {
-  it.each(['backend', 'permission', 'no-mention', 'auto-compact'])('POST /api/project/demo/%s → 501', async (action) => {
+  it.each(['backend', 'backend-profile', 'permission', 'no-mention', 'auto-compact'])('POST /api/project/demo/%s → 501', async (action) => {
     const res = await authed(`/api/project/demo/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -418,6 +421,9 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     svc.switchBackend = async (botId, project, backend) => {
       written.push({ botId, project, backend });
     };
+    svc.setBackendProfile = async (botId, project, profile) => {
+      written.push({ botId, project, profile });
+    };
     svc.setNoMention = async () => {
       throw new AdminWriteError('项目「demo」不存在');
     };
@@ -454,6 +460,16 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     const body = await jsonOf(res);
     expect(body.error).toBe('write_rejected');
     expect(body.message).toContain('不存在');
+  });
+
+  it('命名后端配置写入 → 200，并透传 profile 名称', async () => {
+    const res = await fetch(`${writeBase}/api/project/demo/backend-profile?bot=cli_a`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile: 'work' }),
+    });
+    expect(res.status).toBe(200);
+    expect(written).toContainEqual({ botId: 'cli_a', project: 'demo', profile: 'work' });
   });
 
   it('完成提醒保存 → 200，并把每 bot 设置交给 service', async () => {

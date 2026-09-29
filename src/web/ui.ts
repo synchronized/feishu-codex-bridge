@@ -2326,9 +2326,17 @@ ${UI_PURE_JS}
     var bkName = p.backend ? backendName(p.backend) : 'Codex App Server（默认）';
     var bkRO = el('div', 'statline');
     bkRO.appendChild(el('span', 'tag blue', '🧠 ' + bkName));
+    if (p.backendProfile) bkRO.appendChild(el('span', 'tag', '配置：' + p.backendProfile));
     bkRO.appendChild(el('span', 'tag', '🔒 创建时锁定'));
     d.appendChild(bkRO);
-    d.appendChild(el('div', 'note', '后端在新建项目时选定，运行时固定、不支持切换。如需更改，请删除该项目后用新后端重新创建。'));
+    d.appendChild(el('div', 'note', '命名配置用于选择 CODEX_HOME 等运行环境，只影响新会话；既有话题继续使用创建时的环境快照。'));
+    var profileBtn = el('button', 'btn secondary', p.backendProfile ? '更改命名配置' : '选择命名配置');
+    profileBtn.onclick = function () {
+      var value = window.prompt('输入 config.json 中 backendProfiles 的名称；留空表示继承 daemon 环境。', p.backendProfile || '');
+      if (value === null) return;
+      postWrite('/api/project/' + encodeURIComponent(p.name) + '/backend-profile', { profile: value.trim() });
+    };
+    d.appendChild(profileBtn);
     d.appendChild(el('hr', 'hr'));
 
     // ✋ 免@

@@ -57,6 +57,8 @@ export interface Project {
    * validateBackendSwitch）；只影响新话题——已有话题会话按 SessionRecord.backend
    * 仍走原后端. */
   backend?: string;
+  /** config.json 中 backendProfiles 的名称。缺省时后端继承 daemon 环境。 */
+  backendProfile?: string;
   /** 本项目**新话题**的默认模型 id。优先级在 per-session `/model` 覆盖之下、后端自带
    * 默认之上。跟项目 backend 走（创建时固定）；读取时经 {@link pickDefault} 对后端的
    * **实时**模型列表校验——不在列表里（改了后端 / 模型下架）即忽略、回落后端 isDefault，

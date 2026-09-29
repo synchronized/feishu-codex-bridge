@@ -1,6 +1,8 @@
 import { statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { log } from '../../core/logger';
+import { backendEnvironmentKey } from '../profiles';
+import type { BackendEnvironment } from '../types';
 import { AppServerClient, JsonRpcError } from './app-server-client';
 import { resolveCodexBin } from './locate';
 
@@ -86,22 +88,27 @@ function untrack(client: AppServerClient): void {
 
 // ── utility client（懒创建、出错即重建） ──────────────────────────────
 
-let utility: { client: AppServerClient; bin: string } | null = null;
-let utilityCreating: Promise<unknown> | null = null;
+const utilities = new Map<string, { client: AppServerClient; bin: string }>();
+const utilityCreating = new Map<string, Promise<unknown>>();
 
-async function acquireUtility(bin: string): Promise<AppServerClient> {
+function poolKey(bin: string, env?: BackendEnvironment): string {
+  return `${bin}\0${backendEnvironmentKey(env)}`;
+}
+
+async function acquireUtility(bin: string, env?: BackendEnvironment): Promise<{ client: AppServerClient; key: string }> {
+  const key = poolKey(bin, env);
   // 单飞：先等在途的创建落定，再看槽位（绝不并发 spawn 两个 utility）。
-  while (utilityCreating) await utilityCreating.catch(() => undefined);
-  const cur = utility;
-  if (cur && !cur.client.exited && cur.bin === bin) return cur.client;
+  while (utilityCreating.has(key)) await utilityCreating.get(key)!.catch(() => undefined);
+  const cur = utilities.get(key);
+  if (cur && !cur.client.exited && cur.bin === bin) return { client: cur.client, key };
   if (cur) {
     // 进程死了 / codex 二进制换了位置——重建
-    utility = null;
+    utilities.delete(key);
     untrack(cur.client);
     void cur.client.close().catch(() => undefined);
   }
   const create = (async () => {
-    const client = new AppServerClient({ bin, cwd: NEUTRAL_CWD, clientName: 'feishu-codex-bridge-utility' });
+    const client = new AppServerClient({ bin, cwd: NEUTRAL_CWD, env, clientName: 'feishu-codex-bridge-utility' });
     // 先登记再连接：在途的 connect 撞上进程退出时，exit 钩子也能按 pid 兜底。
     track(client);
     try {
@@ -116,20 +123,20 @@ async function acquireUtility(bin: string): Promise<AppServerClient> {
     void (async () => {
       for await (const n of client.stream()) void n;
     })();
-    utility = { client, bin };
+    utilities.set(key, { client, bin });
     log.info('agent', 'utility-up', { pid: client.pid ?? null });
-    return client;
+    return { client, key };
   })();
-  utilityCreating = create.catch(() => undefined);
+  utilityCreating.set(key, create.catch(() => undefined));
   try {
     return await create;
   } finally {
-    utilityCreating = null;
+    utilityCreating.delete(key);
   }
 }
 
-function discardUtility(client: AppServerClient): void {
-  if (utility?.client === client) utility = null;
+function discardUtility(key: string, client: AppServerClient): void {
+  if (utilities.get(key)?.client === client) utilities.delete(key);
   untrack(client);
   void client.close().catch(() => undefined);
 }
@@ -148,11 +155,11 @@ function discardUtility(client: AppServerClient): void {
 export async function utilityRequest<T = unknown>(
   method: string,
   params?: unknown,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; env?: BackendEnvironment },
 ): Promise<T> {
-  const bin = resolveCodexBin();
+  const bin = opts?.env?.CODEX_BIN || resolveCodexBin();
   if (!bin) throw new Error('codex CLI not found (set CODEX_BIN or install @openai/codex)');
-  const client = await acquireUtility(bin);
+  const { client, key } = await acquireUtility(bin, opts?.env);
   try {
     return await withDeadline(
       client.request<T>(method, params),
@@ -160,7 +167,7 @@ export async function utilityRequest<T = unknown>(
       `utility ${method}`,
     );
   } catch (err) {
-    if (!(err instanceof JsonRpcError)) discardUtility(client);
+    if (!(err instanceof JsonRpcError)) discardUtility(key, client);
     throw err;
   }
 }
@@ -174,8 +181,8 @@ interface WarmEntry {
   fingerprint: string | null;
 }
 
-let warm: WarmEntry | null = null;
-let warming: Promise<void> | null = null;
+const warms = new Map<string, WarmEntry>();
+const warmings = new Map<string, Promise<void>>();
 
 /** bin 文件指纹 = 「codex 版本」的取用时探活代理。statSync 是微秒级且跟随符号
  * 链接，能在取用热进程的瞬间发现「codex 已原地升级/被替换」；版本字符串探测
@@ -195,10 +202,11 @@ function binFingerprint(bin: string): string | null {
  * spawn 不可能双取。失活/版本错位即弃置（refill 会按新二进制补位），返回 null
  * 走冷路径。
  */
-export function takeWarmClient(bin: string): AppServerClient | null {
-  const entry = warm;
+export function takeWarmClient(bin: string, env?: BackendEnvironment): AppServerClient | null {
+  const key = poolKey(bin, env);
+  const entry = warms.get(key);
   if (!entry) return null;
-  warm = null;
+  warms.delete(key);
   untrack(entry.client);
   if (entry.client.exited) return null; // 池中阵亡——冷路径接管
   if (entry.bin !== bin || entry.fingerprint !== binFingerprint(bin)) {
@@ -220,15 +228,16 @@ export function takeWarmClient(bin: string): AppServerClient | null {
  * 弃置无痕）。失败只记日志——预热是纯优化，绝不影响请求路径。
  * 返回在途的补位 Promise（永不 reject），调用方通常 fire-and-forget。
  */
-export function refillWarmPool(): Promise<void> {
-  if (warm || warming) return warming ?? Promise.resolve();
-  warming = (async () => {
-    const bin = resolveCodexBin();
-    if (!bin) return;
+export function refillWarmPool(env?: BackendEnvironment): Promise<void> {
+  const bin = env?.CODEX_BIN || resolveCodexBin();
+  if (!bin) return Promise.resolve();
+  const key = poolKey(bin, env);
+  if (warms.has(key) || warmings.has(key)) return warmings.get(key) ?? Promise.resolve();
+  const warming = (async () => {
     // 指纹在 spawn 之前取——若 spawn 与升级赛跑，取用时的复验自会兜住。
     const fingerprint = binFingerprint(bin);
     // clientName 用默认值：这个进程取走后就是真实会话的进程（compliance log 同名）。
-    const client = new AppServerClient({ bin, cwd: NEUTRAL_CWD });
+    const client = new AppServerClient({ bin, cwd: NEUTRAL_CWD, env });
     // 先登记再预热：补位进行中 daemon 退出时，exit 钩子也能按 pid 兜底。
     track(client);
     try {
@@ -243,7 +252,7 @@ export function refillWarmPool(): Promise<void> {
         PREWARM_TIMEOUT_MS,
         'prewarm thread/start',
       );
-      warm = { client, bin, fingerprint };
+      warms.set(key, { client, bin, fingerprint });
       log.info('agent', 'prewarm-ready', { pid: client.pid ?? null });
     } catch (err) {
       log.fail('agent', err, { phase: 'prewarm' });
@@ -251,8 +260,9 @@ export function refillWarmPool(): Promise<void> {
       void client.close().catch(() => undefined);
     }
   })().finally(() => {
-    warming = null;
+    warmings.delete(key);
   });
+  warmings.set(key, warming);
   return warming;
 }
 
@@ -262,17 +272,13 @@ export function refillWarmPool(): Promise<void> {
  * 'exit' 钩子兜底；这个出口给测试与未来的显式接线用。 */
 export async function shutdownResidentClients(): Promise<void> {
   // 等在途的创建/补位落定，否则它们会在我们清完之后才把进程放进槽位
-  while (utilityCreating) await utilityCreating.catch(() => undefined);
-  if (warming) await warming.catch(() => undefined);
+  while (utilityCreating.size) await Promise.allSettled([...utilityCreating.values()]);
+  if (warmings.size) await Promise.allSettled([...warmings.values()]);
   const targets: AppServerClient[] = [];
-  if (utility) {
-    targets.push(utility.client);
-    utility = null;
-  }
-  if (warm) {
-    targets.push(warm.client);
-    warm = null;
-  }
+  for (const entry of utilities.values()) targets.push(entry.client);
+  utilities.clear();
+  for (const entry of warms.values()) targets.push(entry.client);
+  warms.clear();
   for (const c of targets) untrack(c);
   await Promise.allSettled(targets.map((c) => c.close()));
 }

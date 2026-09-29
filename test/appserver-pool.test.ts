@@ -44,6 +44,7 @@ process.stdin.on('data', (d) => {
     if (m === 'emit') send({ jsonrpc: '2.0', method: 'real/event', params: {} });
     const result =
       m === 'model/list' ? { data: [{ id: 'pool-model', isDefault: true }] } :
+      m === 'env/read' ? { value: process.env.CODEX_HOME || '' } :
       m === 'thread/list' ? { data: [{ id: 't1', preview: 'hi', createdAt: 1, updatedAt: 2 }] } :
       m === 'thread/read' ? { thread: { turns: [] } } :
       m === 'thread/start' ? { thread: { id: 'th_real' } } :
@@ -141,6 +142,15 @@ describe.skipIf(process.platform === 'win32')('utility client 复用与出错即
     expect(res.data[0]!.id).toBe('pool-model');
     expect(runs()).toBe(2);
   });
+
+  it('不同 CODEX_HOME 使用不同 utility 进程，同一环境仍复用', async () => {
+    const { runs } = makeFakeCodex();
+    const a = await utilityRequest<{ value: string }>('env/read', {}, { env: { CODEX_HOME: '/tmp/codex-a' } });
+    const b = await utilityRequest<{ value: string }>('env/read', {}, { env: { CODEX_HOME: '/tmp/codex-b' } });
+    const again = await utilityRequest<{ value: string }>('env/read', {}, { env: { CODEX_HOME: '/tmp/codex-a' } });
+    expect([a.value, b.value, again.value]).toEqual(['/tmp/codex-a', '/tmp/codex-b', '/tmp/codex-a']);
+    expect(runs()).toBe(2);
+  });
 });
 
 describe.skipIf(process.platform === 'win32')('容量 1 预热池（M-2）', () => {
@@ -180,6 +190,20 @@ describe.skipIf(process.platform === 'win32')('容量 1 预热池（M-2）', () 
     appendFileSync(bin, '\n// upgraded\n'); // mtime+size 都变 —— 模拟原地升级
     expect(takeWarmClient(bin)).toBeNull();
     expect(runs()).toBe(1); // 没有偷偷用旧进程
+  });
+
+  it('不同 CODEX_HOME 的预热槽互相隔离', async () => {
+    const { bin, runs } = makeFakeCodex();
+    const envA = { CODEX_HOME: '/tmp/codex-a' };
+    const envB = { CODEX_HOME: '/tmp/codex-b' };
+    await Promise.all([refillWarmPool(envA), refillWarmPool(envB)]);
+    expect(runs()).toBe(2);
+    const a = takeWarmClient(bin, envA);
+    expect(a).not.toBeNull();
+    expect(takeWarmClient(bin, envA)).toBeNull();
+    const b = takeWarmClient(bin, envB);
+    expect(b).not.toBeNull();
+    await Promise.allSettled([a!.close(), b!.close()]);
   });
 
   it('backend.startThread：冷路径触发补位，下一个会话复用热进程', async () => {

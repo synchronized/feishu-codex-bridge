@@ -1,4 +1,5 @@
 import { rmSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { paths } from '../src/config/paths';
 import { addProject, getProjectByName, removeProject } from '../src/project/registry';
@@ -9,6 +10,7 @@ import {
   performBackendSwitch,
   performSetAutoCompact,
   performSetCompletionReminder,
+  performSetBackendProfile,
   performSetNoMention,
   performSetPermissionMode,
   probeBackends as opsProbeBackends,
@@ -132,6 +134,30 @@ describe('performSetNoMention / performSetAutoCompact', () => {
     expect(r1.ok).toBe(false);
     expect(r2.ok).toBe(false);
     expect(evict).not.toHaveBeenCalled();
+  });
+});
+
+describe('performSetBackendProfile', () => {
+  const cfg: AppConfig = {
+    accounts: { app: { id: 'cli_test', secret: 'secret', tenant: 'feishu' } },
+    backendProfiles: {
+      work: { backend: 'codex-appserver', env: { CODEX_HOME: resolve(paths.appDir, 'codex-work') } },
+    },
+  };
+
+  it('已定义 profile 可写入项目，空值可恢复继承 daemon 环境', async () => {
+    const set = await performSetBackendProfile({ cfg, projectName: 'demo', profile: 'work' });
+    expect(set.ok).toBe(true);
+    expect((await getProjectByName('demo'))?.backendProfile).toBe('work');
+    const clear = await performSetBackendProfile({ cfg, projectName: 'demo', profile: '' });
+    expect(clear.ok).toBe(true);
+    expect((await getProjectByName('demo'))?.backendProfile).toBe('');
+  });
+
+  it('不存在的 profile 被拒绝且不落盘', async () => {
+    const result = await performSetBackendProfile({ cfg, projectName: 'demo', profile: 'missing' });
+    expect(result.ok).toBe(false);
+    expect((await getProjectByName('demo'))?.backendProfile).toBeUndefined();
   });
 });
 

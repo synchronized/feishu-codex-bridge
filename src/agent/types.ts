@@ -25,6 +25,13 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
  */
 export type PermissionMode = 'qa' | 'write' | 'full';
 
+/** 后端子进程的项目级环境覆盖。仅由已校验的命名 profile 产生。 */
+export type BackendEnvironment = Record<string, string>;
+
+export interface BackendRuntimeOptions {
+  env?: BackendEnvironment;
+}
+
 export interface AgentInput {
   text?: string;
   /** absolute local paths of images the user sent — codex reads them directly as
@@ -250,6 +257,8 @@ export interface AgentThread {
 
 export interface StartThreadOptions {
   cwd: string;
+  /** 创建后端进程时使用的命名配置环境快照。 */
+  env?: BackendEnvironment;
   model?: string;
   effort?: ReasoningEffort;
   /** permission tier; undefined → 'full' (preserves legacy danger-full-access) */
@@ -277,6 +286,7 @@ export interface GenerateSessionTitleOptions {
   prompt: string;
   model: string;
   effort: ReasoningEffort;
+  env?: BackendEnvironment;
 }
 
 // ── 账号用量（归一化）──────────────────────────────────────────────────
@@ -425,22 +435,22 @@ export interface AgentBackend {
    * 「现在」的状态）。绝不抛错，必须全程异步（卡片回调里 spawnSync 会冻住
    * 事件循环——见 DM.doctor）。 */
   doctor(opts?: { force?: boolean }): Promise<BackendProbe>;
-  listModels(): Promise<ModelInfo[]>;
+  listModels(runtime?: BackendRuntimeOptions): Promise<ModelInfo[]>;
   /** recent codex threads under `cwd`, newest first (for resume picker) */
-  listThreads(cwd: string, limit?: number): Promise<ThreadSummary[]>;
+  listThreads(cwd: string, limit?: number, runtime?: BackendRuntimeOptions): Promise<ThreadSummary[]>;
   /**
    * A past thread's transcript for the resume history card — reads it via
    * `thread/read` (includeTurns) WITHOUT starting a turn or holding the session
    * live. Keeps the last `maxTurns` turns; never throws (returns empty on fail).
    */
-  readHistory(cwd: string, sessionId: string, maxTurns?: number): Promise<ThreadHistory>;
+  readHistory(cwd: string, sessionId: string, maxTurns?: number, runtime?: BackendRuntimeOptions): Promise<ThreadHistory>;
   /** Read the backend-native user title only (not preview/auto summary). Undefined
    * means this session has no title yet. Kept optional for future backends that
    * cannot participate in native resume-title synchronization. */
-  readSessionTitle?(cwd: string, sessionId: string): Promise<string | undefined>;
+  readSessionTitle?(cwd: string, sessionId: string, runtime?: BackendRuntimeOptions): Promise<string | undefined>;
   /** Persist a title through the backend's native session store so its own CLI
    * resume picker sees it (codex: thread/name/set; Claude: customTitle). */
-  setSessionTitle?(cwd: string, sessionId: string, title: string): Promise<void>;
+  setSessionTitle?(cwd: string, sessionId: string, title: string, runtime?: BackendRuntimeOptions): Promise<void>;
   /** Run an isolated, non-persistent one-shot generation with the exact selected
    * model and effort. Empty model output is represented as undefined; runtime
    * errors intentionally propagate so the coordinator can apply its fallback. */

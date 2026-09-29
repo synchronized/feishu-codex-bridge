@@ -46,6 +46,8 @@ export interface CreateProjectInput {
   /** agent backend chosen at creation (fixed afterwards — no switching). When
    *  omitted, runtime falls back to DEFAULT_BACKEND_ID (codex). */
   backend?: string;
+  /** config.json 中 backendProfiles 的名称。 */
+  backendProfile?: string;
   /** allow the sandboxed shell to reach the network (default false). */
   network?: boolean;
 }
@@ -67,6 +69,8 @@ export interface JoinGroupInput {
   mode?: PermissionMode;
   /** agent backend chosen at bind time (fixed afterwards — no switching). */
   backend?: string;
+  /** config.json 中 backendProfiles 的名称。 */
+  backendProfile?: string;
   /** allow the sandboxed shell to reach the network (default false). */
   network?: boolean;
 }
@@ -164,6 +168,7 @@ export async function createProject(channel: LarkChannel, input: CreateProjectIn
     origin: 'created',
     mode: input.mode ?? 'full',
     backend: input.backend || undefined,
+    backendProfile: input.backendProfile || undefined,
     network: input.network ?? false,
   };
   await addProject(project);
@@ -206,6 +211,7 @@ export async function joinExistingGroup(channel: LarkChannel, input: JoinGroupIn
     addedBy: input.addedBy,
     mode: input.mode ?? 'qa',
     backend: input.backend || undefined,
+    backendProfile: input.backendProfile || undefined,
     network: input.network ?? false,
   };
   await addProject(project);

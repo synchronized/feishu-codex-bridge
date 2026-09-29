@@ -176,6 +176,16 @@ export interface AppConfig {
   };
   secrets?: SecretsConfig;
   preferences?: AppPreferences;
+  /** 命名后端运行配置。项目通过 Project.backendProfile 引用；不配置时完全沿用
+   * daemon 环境。当前仅 codex-appserver 支持，用于让不同项目选择不同 CODEX_HOME。 */
+  backendProfiles?: Record<string, BackendProfileConfig | undefined>;
+}
+
+/** 可持久化的后端运行配置。env 会写入 config.json，因此只接受 profiles.ts 中的
+ * 非秘密变量白名单；API Key 等秘密不得放在这里。 */
+export interface BackendProfileConfig {
+  backend: 'codex-appserver';
+  env?: Record<string, string | undefined>;
 }
 
 export function isComplete(cfg: Partial<AppConfig>): cfg is AppConfig {

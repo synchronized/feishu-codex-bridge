@@ -482,7 +482,7 @@ export function createWebServer(opts: WebServerOptions): WebServer {
 
     // POST 写操作 —— daemon 进程内为真实写入（共享 admin/ops.ts，与 DM 卡片同
     // 源）；只读预览进程映射 501（NotWiredYetError），校验拒绝映射 409。
-    const writeMatch = /^\/api\/project\/([^/]+)\/(backend|permission|no-mention|auto-compact)$/.exec(pathName);
+    const writeMatch = /^\/api\/project\/([^/]+)\/(backend|backend-profile|permission|no-mention|auto-compact)$/.exec(pathName);
     if (req.method === 'POST' && writeMatch) {
       const project = decodeURIComponent(writeMatch[1]!);
       const action = writeMatch[2]!;
@@ -501,6 +501,8 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       try {
         if (action === 'backend') {
           await opts.service.switchBackend(botId, project, String(body.backend ?? ''));
+        } else if (action === 'backend-profile') {
+          await opts.service.setBackendProfile(botId, project, typeof body.profile === 'string' ? body.profile : undefined);
         } else if (action === 'permission') {
           await opts.service.setPermissionMode(botId, project, {
             mode: body.mode as never,

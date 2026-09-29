@@ -1,4 +1,4 @@
-import type { ModelInfo, ReasoningEffort, ThreadSummary } from '../agent/types';
+import type { BackendEnvironment, ModelInfo, ReasoningEffort, ThreadSummary } from '../agent/types';
 import { actions, button, card, hr, linkButton, md, note, selectStatic, type CardElement, type CardObject } from './cards';
 
 /** Action ids for the `/model` card. */
@@ -117,6 +117,8 @@ export interface ResumeCardState {
    * callback value (`b`) so the resume stays on the same backend. Unset on
    * legacy state → default (codex). */
   backend?: string;
+  backendProfile?: string;
+  backendEnv?: BackendEnvironment;
   threads: ThreadSummary[];
   createdAt: number;
   /** in-flight guard (anti double-click) */

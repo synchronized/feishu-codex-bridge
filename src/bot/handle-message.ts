@@ -15,10 +15,12 @@ import {
   type AgentInput,
   type AgentRun,
   type AgentThread,
+  type BackendEnvironment,
   type ModelInfo,
   type PermissionMode,
   type ReasoningEffort,
 } from '../agent/types';
+import { resolveBackendProfile } from '../agent/profiles';
 import type { SelectOption } from '../card/cards';
 import {
   createAppPreferencesWriter,
@@ -692,6 +694,25 @@ export function createOrchestrator(
   const backend = backendFor();
   const sessionTitles = new SessionTitleCoordinator({ backendFor: (id) => backendFor(id) });
 
+  /** 项目选择的命名后端配置。解析失败必须在启动会话前显式报错，绝不静默回落
+   * daemon 环境，否则很容易用错 Codex 账号。 */
+  function projectBackendRuntime(project: Project | undefined): {
+    profile?: string;
+    env?: BackendEnvironment;
+  } {
+    if (!project?.backendProfile) return {};
+    const backendId = project.backend ?? DEFAULT_BACKEND_ID;
+    return {
+      profile: project.backendProfile,
+      env: resolveBackendProfile(cfg, project.backendProfile, backendId),
+    };
+  }
+
+  /** 会话优先使用创建时持久化的环境快照；只有较早的过渡记录才按 profile 名回查。 */
+  function sessionBackendEnv(rec: SessionRecord): BackendEnvironment | undefined {
+    return rec.backendEnv ?? resolveBackendProfile(cfg, rec.backendProfile, rec.backend);
+  }
+
   /** Snapshot the selected backend's title policy when its native session is
    * created. Later DM-setting changes affect future sessions only. */
   function sessionTitlePolicy(backendId: string): SessionTitlePolicySnapshot {
@@ -708,12 +729,14 @@ export function createOrchestrator(
     sessionId: string,
     cwd: string,
     source?: SessionTitleSource,
+    backendEnv?: BackendEnvironment,
   ): Promise<string | undefined> {
     try {
       return await sessionTitles.register({
         backend: be.id,
         sessionId,
         cwd,
+        backendEnv,
         source,
         policy: sessionTitlePolicy(be.id),
       });
@@ -839,7 +862,7 @@ export function createOrchestrator(
    * claude 的静态常量），这层不再缓存——codex 瞬时不可用时返回的 STATIC_MODELS
    * 兜底一旦缓存在这层，会被钉死整个 daemon 生命周期（backend 故意不缓存失败
    * 结果，让下次调用重试；见 codex-appserver/backend.listModels）。 */
-  const listModels = (be: AgentBackend = backend): Promise<ModelInfo[]> => be.listModels();
+  const listModels = (be: AgentBackend = backend, env?: BackendEnvironment): Promise<ModelInfo[]> => be.listModels({ env });
 
   // Feishu gives bots no way to mark a message "已读" (read receipts are a
   // human-client signal), so a reaction stands in for one. Best-effort — a
@@ -1454,18 +1477,21 @@ export function createOrchestrator(
           // a fresh session bound to the resolved cwd, on the project's backend.
           const cwd = project?.cwd ?? fallbackCwd;
           const be = backendFor(project?.backend);
-          thread = await be.startThread({ cwd, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
+          const runtime = projectBackendRuntime(project);
+          thread = await be.startThread({ cwd, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact, env: runtime.env });
           trackSession(sessionKey, thread);
           // 自愈观测：来源=全新会话（无持久化记录），与 resume-ok/resume-recreate
           // 互斥——三者其一 + agent 层的 spawn/prewarm-hit 即可还原完整恢复路径。
           log.info('agent', 'session-fresh', { sessionKey, sessionId: thread.sessionId, backend: be.id });
-          titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
+          titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource, runtime.env);
           await upsertSession({
             threadId: sessionKey,
             chatId: msg.chatId,
             cwd,
             sessionId: thread.sessionId,
             backend: be.id,
+            backendProfile: runtime.profile,
+            backendEnv: runtime.env,
             titleJobKey,
             // `text` is already file-woven when preIngested; use the raw
             // `summaryText` (handleTurn's original) so the session label isn't
@@ -1480,7 +1506,8 @@ export function createOrchestrator(
           // 应独立登记标题任务（旧 sessionId 的 ledger/标题绝不复用）。
           const be = backendFor(prior?.backend ?? project?.backend);
           const cwd = project?.cwd ?? prior?.cwd ?? fallbackCwd;
-          titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
+          const backendEnv = prior ? sessionBackendEnv(prior) : projectBackendRuntime(project).env;
+          titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource, backendEnv);
           // Full replacement drops the old session's titleJobKey even if title
           // registration failed; carrying it across would let a later turn attach
           // source to the wrong native session.
@@ -1597,6 +1624,7 @@ export function createOrchestrator(
     // is still consulted for cwd / tier defaults on the recreate path below.
     const project = await getProjectByChatId(chatId);
     const be = backendFor(rec.backend);
+    const backendEnv = sessionBackendEnv(rec);
     try {
       const resumed = await be.resumeThread({
         cwd: rec.cwd,
@@ -1606,6 +1634,7 @@ export function createOrchestrator(
         mode: perm?.mode,
         network: perm?.network,
         autoCompact: perm?.autoCompact,
+        env: backendEnv,
       });
       trackSession(threadId, resumed);
       // 自愈观测：resume 来源=持久化记录（区分「resume 自愈」与 LIVE 快路径的
@@ -1622,6 +1651,7 @@ export function createOrchestrator(
         mode: perm?.mode ?? project?.mode,
         network: perm?.network ?? project?.network,
         autoCompact: perm?.autoCompact ?? project?.autoCompact,
+        env: backendEnv,
       });
       trackSession(threadId, fresh);
       // The resumed codex thread is gone — repoint the persisted record at the
@@ -1679,6 +1709,7 @@ export function createOrchestrator(
       // Pick the default model FROM THE PROJECT'S BACKEND — a claude project must
       // not be handed codex's default ('gpt-5.5'). Unset backend → codex, as before.
       const be = backendFor(project?.backend);
+      const runtime = projectBackendRuntime(project);
       // ── 入站并行（M-1）── listModels+startThread（本地 spawn，实测 250ms–1.6s）
       // 与图片下载 / 文件+引用织入（飞书 API）互不依赖。任何一路失败都终止本轮
       // 并回 ❌（原先 ingest 失败只进日志、reaction 卡死——顺带修正），但已起的
@@ -1686,11 +1717,11 @@ export function createOrchestrator(
       const tIntake = Date.now();
       let tResolveDone = tIntake;
       const threadP = (async () => {
-        const { model, effort } = pickDefault(await listModels(be), {
+        const { model, effort } = pickDefault(await listModels(be, runtime.env), {
           model: project?.defaultModel,
           effort: project?.defaultEffort,
         });
-        const thread = await be.startThread({ cwd, model, effort, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
+        const thread = await be.startThread({ cwd, model, effort, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact, env: runtime.env });
         tResolveDone = Date.now();
         return { thread, model, effort };
       })();
@@ -1719,7 +1750,7 @@ export function createOrchestrator(
         return;
       }
       log.info('card', 'start', { project: project?.name ?? '(unregistered)', model, effort, images: images?.length ?? 0, goal: Boolean(goal) });
-      const titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
+      const titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource, runtime.env);
       const launchOpts: LaunchOpts = {
         chatId: msg.chatId,
         replyTo: msg.messageId,
@@ -1735,6 +1766,8 @@ export function createOrchestrator(
         requestedAt: msg.createTime || tIntake,
         roleSuffix: perm.roleSuffix,
         backendId: be.id,
+        backendProfile: runtime.profile,
+        backendEnv: runtime.env,
         titleJobKey,
         titleSource,
         timing: { tResolve: tResolveDone - tIntake, tWeave: Date.now() - tIntake },
@@ -1767,7 +1800,8 @@ export function createOrchestrator(
         // button's callback value (`b`), so the pick → readHistory → rebind path
         // stays on the same backend that listed the sessions.
         const be = backendFor(project?.backend);
-        const threads = await be.listThreads(cwd);
+        const runtime = projectBackendRuntime(project);
+        const threads = await be.listThreads(cwd, undefined, { env: runtime.env });
         const state: ResumeCardState = {
           chatId: msg.chatId,
           originalMsgId: msg.messageId,
@@ -1775,6 +1809,8 @@ export function createOrchestrator(
           cwd,
           projectName: project?.name,
           backend: be.id,
+          backendProfile: runtime.profile,
+          backendEnv: runtime.env,
           threads,
           createdAt: Date.now(),
           // Single-session group: pick rebinds this key flat (no new topic).
@@ -1805,7 +1841,8 @@ export function createOrchestrator(
         // 持久化，重启 resume 会把 codex model id 喂给 claude CLI，会话坏死。
         const [rec, project] = await Promise.all([getSession(sessionKey), getProjectByChatId(msg.chatId)]);
         const be = backendFor(rec?.backend ?? project?.backend);
-        const models = await listModels(be);
+        const backendEnv = rec ? sessionBackendEnv(rec) : projectBackendRuntime(project).env;
+        const models = await listModels(be, backendEnv);
         // Seed the /model card's "current" from the project default (when this
         // topic has no session record yet) so a fresh topic shows what it WILL
         // start on; pickDefault validates it against the live list.
@@ -2002,6 +2039,9 @@ export function createOrchestrator(
         // codex thread for a codex session, claude for a claude one.
         const be = backendFor(rec?.backend ?? project?.backend);
         const cwd = rec?.cwd ?? project?.cwd ?? fallbackCwd;
+        // /clear 创建全新的原生会话，因此采用项目“当前”profile；旧会话仍保留
+        // 自己的环境快照，可从 /resume 列表按旧环境恢复。
+        const runtime = projectBackendRuntime(project);
         // Carry the session's chosen model/effort into the new thread so /clear
         // resets the CONVERSATION, not the user's model pick. Tier (mode/network/
         // autoCompact) comes from the caller's live perm.
@@ -2012,6 +2052,7 @@ export function createOrchestrator(
           mode: perm.mode,
           network: perm.network,
           autoCompact: perm.autoCompact,
+          env: runtime.env,
         });
         // Close + evict the parked live thread (a separate app-server proc); its
         // on-disk session survives for /resume. Then track the fresh one.
@@ -2025,13 +2066,15 @@ export function createOrchestrator(
         // `/clear` has no user question to title from. Park a policy-snapshotted
         // waiting job; the next real message supplies the source and activates it
         // only after that host turn is issued.
-        const titleJobKey = await registerSessionTitle(be, fresh.sessionId, cwd);
+        const titleJobKey = await registerSessionTitle(be, fresh.sessionId, cwd, undefined, runtime.env);
         await upsertSession({
           threadId: sessionKey,
           chatId: msg.chatId,
           cwd,
           sessionId: fresh.sessionId,
           backend: be.id,
+          backendProfile: runtime.profile,
+          backendEnv: runtime.env,
           titleJobKey,
           model: rec?.model,
           effort: rec?.effort,
@@ -3498,7 +3541,7 @@ export function createOrchestrator(
       patch(evt, async () => {
         const project = await getProjectByChatId(evt.chatId);
         if (!project) return buildGroupSettingsCard({ name: '本群', kind: 'multi' });
-        const models = await listModels(backendFor(project.backend));
+        const models = await listModels(backendFor(project.backend), projectBackendRuntime(project).env);
         return buildModelDefaultCard(project, models, 'group');
       });
     })
@@ -3509,7 +3552,7 @@ export function createOrchestrator(
       void (async () => {
         const project = await getProjectByChatId(evt.chatId);
         if (!project) return;
-        const models = await listModels(backendFor(project.backend));
+        const models = await listModels(backendFor(project.backend), projectBackendRuntime(project).env);
         const m = modelId ? models.find((x) => x.id === modelId && !x.hidden) : undefined;
         if (m) {
           const supported = m.supportedEfforts ?? [];
@@ -3699,7 +3742,7 @@ export function createOrchestrator(
       patch(evt, async () => {
         const p = await getProjectByName(name);
         if (!p) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
-        const models = await listModels(backendFor(p.backend));
+        const models = await listModels(backendFor(p.backend), projectBackendRuntime(p).env);
         return buildModelDefaultCard(p, models, 'dm');
       });
     })
@@ -3714,7 +3757,7 @@ export function createOrchestrator(
       void (async () => {
         const p = await getProjectByName(name);
         if (!p) return;
-        const models = await listModels(backendFor(p.backend));
+        const models = await listModels(backendFor(p.backend), projectBackendRuntime(p).env);
         const m = modelId ? models.find((x) => x.id === modelId && !x.hidden) : undefined;
         let notice: string;
         if (!m) {
@@ -3780,7 +3823,7 @@ export function createOrchestrator(
         const reserved: ActiveState = { queue: [], requesterOpenId: state.requesterOpenId };
         active.set(sessionKey, reserved);
         try {
-          const history = await be.readHistory(state.cwd, sessionId);
+          const history = await be.readHistory(state.cwd, sessionId, undefined, { env: state.backendEnv });
           resumePending.delete(evt.messageId);
           await withTrace({ chatId: state.chatId, msgId: state.originalMsgId }, async () => {
             const cardState: HistoryCardState = { cwd: state.cwd, projectName: state.projectName, history };
@@ -3803,6 +3846,8 @@ export function createOrchestrator(
               cwd: state.cwd,
               sessionId,
               backend: be.id,
+              backendProfile: state.backendProfile,
+              backendEnv: state.backendEnv,
               summary: history.name || history.preview || '(恢复会话)',
               createdAt: now,
               updatedAt: now,
@@ -3827,7 +3872,7 @@ export function createOrchestrator(
       // thread/read: fetch the transcript without starting a turn or holding the
       // session live (model/effort left to the thread's own remembered config).
       // Never throws — empty history just yields a minimal card.
-      const history = await be.readHistory(state.cwd, sessionId);
+      const history = await be.readHistory(state.cwd, sessionId, undefined, { env: state.backendEnv });
       resumePending.delete(evt.messageId);
 
       let bound = false;
@@ -3850,6 +3895,8 @@ export function createOrchestrator(
             cwd: state.cwd,
             sessionId,
             backend: be.id,
+            backendProfile: state.backendProfile,
+            backendEnv: state.backendEnv,
             summary: history.name || history.preview || '(恢复会话)',
             createdAt: now,
             updatedAt: now,
@@ -3913,6 +3960,9 @@ export function createOrchestrator(
     /** the backend that created `thread` (persisted into the SessionRecord so a
      * restart resumes on the same runtime). Unset → default (codex). */
     backendId?: string;
+    /** 创建该会话的命名后端配置及已校验环境快照。 */
+    backendProfile?: string;
+    backendEnv?: BackendEnvironment;
     /** Durable title ledger key for a Bridge-owned, newly-created native
      * session. Absent for manual /resume, legacy sessions, and doc comments. */
     titleJobKey?: string;
@@ -4092,6 +4142,8 @@ export function createOrchestrator(
         cwd: opts.cwd ?? fallbackCwd,
         sessionId: opts.thread.sessionId,
         backend: opts.backendId ?? DEFAULT_BACKEND_ID,
+        backendProfile: opts.backendProfile,
+        backendEnv: opts.backendEnv,
         titleJobKey: opts.titleJobKey,
         model: opts.model,
         effort: opts.effort,
@@ -4598,6 +4650,8 @@ export function createOrchestrator(
         cwd: opts.cwd ?? fallbackCwd,
         sessionId: opts.thread.sessionId,
         backend: opts.backendId ?? DEFAULT_BACKEND_ID,
+        backendProfile: opts.backendProfile,
+        backendEnv: opts.backendEnv,
         titleJobKey: opts.titleJobKey,
         model: opts.model,
         effort: opts.effort,

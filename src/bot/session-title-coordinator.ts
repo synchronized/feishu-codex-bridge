@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { AgentBackend } from '../agent/types';
+import type { AgentBackend, BackendEnvironment } from '../agent/types';
 import { log } from '../core/logger';
 import {
   createSessionTitleJob,
@@ -44,6 +44,7 @@ export interface RegisterSessionTitleInput {
   backend: string;
   sessionId: string;
   cwd: string;
+  backendEnv?: BackendEnvironment;
   /** The first user message, captured before Bridge prompt weaving. */
   source?: SessionTitleSource;
   /** Captured now so later settings changes cannot alter an existing job. */
@@ -92,6 +93,7 @@ function terminalJob(
     backend: current.backend,
     sessionId: current.sessionId,
     cwd: current.cwd,
+    ...(current.backendEnv ? { backendEnv: current.backendEnv } : {}),
     phase: outcome === 'written' ? 'done' : 'skipped',
     attempts: current.attempts,
     outcome,
@@ -151,6 +153,7 @@ export class SessionTitleCoordinator {
       backend: input.backend,
       sessionId: input.sessionId,
       cwd: input.cwd,
+      ...(input.backendEnv ? { backendEnv: input.backendEnv } : {}),
       // A session can be created before its first turn actually starts (notably
       // /clear and a run waiting in the global queue). Recovery must not title
       // that empty/cancelled session, so source-ready jobs wait for an explicit
@@ -313,7 +316,11 @@ export class SessionTitleCoordinator {
     }
 
     try {
-      const existing = (await backend.readSessionTitle(job.cwd, job.sessionId))?.trim();
+      const existing = (
+        await (job.backendEnv
+          ? backend.readSessionTitle(job.cwd, job.sessionId, { env: job.backendEnv })
+          : backend.readSessionTitle(job.cwd, job.sessionId))
+      )?.trim();
       if (existing) {
         await this.finishClaim(job, claimId, 'preexisting', existing);
         return;
@@ -345,6 +352,7 @@ export class SessionTitleCoordinator {
             prompt: plan.prompt,
             model: policy.model,
             effort: policy.effort,
+            ...(job.backendEnv ? { env: job.backendEnv } : {}),
           });
           candidate = cleanGeneratedSessionTitle(generated ?? '', plan.fallbackTitle);
         } catch (err) {
@@ -412,7 +420,11 @@ export class SessionTitleCoordinator {
 
     let existing: string | undefined;
     try {
-      existing = (await backend.readSessionTitle(job.cwd, job.sessionId))?.trim();
+      existing = (
+        await (job.backendEnv
+          ? backend.readSessionTitle(job.cwd, job.sessionId, { env: job.backendEnv })
+          : backend.readSessionTitle(job.cwd, job.sessionId))
+      )?.trim();
     } catch (err) {
       // No native mutation is possible before the durable write boundary, so a
       // transient read failure remains safely retryable.
@@ -459,7 +471,11 @@ export class SessionTitleCoordinator {
     if (!armed) return;
 
     try {
-      await backend.setSessionTitle(job.cwd, job.sessionId, job.candidate);
+      if (job.backendEnv) {
+        await backend.setSessionTitle(job.cwd, job.sessionId, job.candidate, { env: job.backendEnv });
+      } else {
+        await backend.setSessionTitle(job.cwd, job.sessionId, job.candidate);
+      }
       await this.finishClaim(job, claimId, 'written', job.candidate);
       log.info('agent', 'session-title-written', { backend: job.backend, sessionId: job.sessionId });
     } catch (err) {
@@ -470,7 +486,11 @@ export class SessionTitleCoordinator {
         // once for diagnostics, but never release to `prepared` (which would
         // permit a second mutation after a stale/lagged read).
         try {
-          const observed = (await backend.readSessionTitle(job.cwd, job.sessionId))?.trim();
+          const observed = (
+            await (job.backendEnv
+              ? backend.readSessionTitle(job.cwd, job.sessionId, { env: job.backendEnv })
+              : backend.readSessionTitle(job.cwd, job.sessionId))
+          )?.trim();
           await this.finishClaim(
             job,
             claimId,

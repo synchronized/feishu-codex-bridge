@@ -6,7 +6,9 @@ import type {
   AgentInput,
   AgentRun,
   AgentThread,
+  BackendEnvironment,
   BackendProbe,
+  BackendRuntimeOptions,
   CompactResult,
   GenerateSessionTitleOptions,
   HistoryTool,
@@ -20,6 +22,7 @@ import type {
   ThreadSummary,
   TurnOptions,
 } from '../types';
+import { backendEnvironmentKey } from '../profiles';
 import { isGoalTerminal } from '../types';
 import { BRIDGE_DEVELOPER_INSTRUCTIONS } from '../bridge-instructions';
 import { AppServerClient } from './app-server-client';
@@ -183,14 +186,14 @@ export interface CodexTitleClient {
 export interface CodexTitleBackendDeps {
   utilityRequest: typeof utilityRequest;
   resolveBin: typeof resolveCodexBin;
-  createClient(bin: string, cwd: string): CodexTitleClient;
+  createClient(bin: string, cwd: string, env?: BackendEnvironment): CodexTitleClient;
 }
 
 const DEFAULT_TITLE_DEPS: CodexTitleBackendDeps = {
   utilityRequest,
   resolveBin: resolveCodexBin,
-  createClient: (bin, cwd) =>
-    new AppServerClient({ bin, cwd, clientName: 'feishu-codex-bridge-title' }),
+  createClient: (bin, cwd, env) =>
+    new AppServerClient({ bin, cwd, env, clientName: 'feishu-codex-bridge-title' }),
 };
 
 function parseGeneratedTitle(text: string): string | undefined {
@@ -566,7 +569,7 @@ class CodexThread implements AgentThread {
 export class CodexAppServerBackend implements AgentBackend {
   readonly id = 'codex-appserver';
   readonly displayName = 'Codex (app-server)';
-  private modelCache: ModelInfo[] | null = null;
+  private readonly modelCache = new Map<string, ModelInfo[]>();
 
   constructor(private readonly titleDeps: CodexTitleBackendDeps = DEFAULT_TITLE_DEPS) {}
 
@@ -593,31 +596,33 @@ export class CodexAppServerBackend implements AgentBackend {
     return { ok: true, version, location: bin };
   }
 
-  async listModels(): Promise<ModelInfo[]> {
-    if (this.modelCache) return this.modelCache;
-    if (!resolveCodexBin()) return STATIC_MODELS;
+  async listModels(runtime?: BackendRuntimeOptions): Promise<ModelInfo[]> {
+    const cacheKey = backendEnvironmentKey(runtime?.env);
+    const cached = this.modelCache.get(cacheKey);
+    if (cached) return cached;
+    if (!(runtime?.env?.CODEX_BIN || resolveCodexBin())) return STATIC_MODELS;
     try {
       // 常驻 utility client（M-2）：原本每次付一套 spawn+initialize，现在共享复用。
-      const res = await utilityRequest<{ data?: RawModel[] }>('model/list', { limit: 50 });
+      const res = await utilityRequest<{ data?: RawModel[] }>('model/list', { limit: 50 }, { env: runtime?.env });
       const models = (res.data ?? []).map(mapModel);
-      this.modelCache = models.length ? models : STATIC_MODELS;
-      return this.modelCache;
+      const value = models.length ? models : STATIC_MODELS;
+      this.modelCache.set(cacheKey, value);
+      return value;
     } catch (err) {
       log.fail('agent', err, { phase: 'model/list' });
       return STATIC_MODELS;
     }
   }
 
-  async listThreads(cwd: string, limit = 15): Promise<ThreadSummary[]> {
-    if (!resolveCodexBin()) return [];
+  async listThreads(cwd: string, limit = 15, runtime?: BackendRuntimeOptions): Promise<ThreadSummary[]> {
+    if (!(runtime?.env?.CODEX_BIN || resolveCodexBin())) return [];
     try {
       // cwd 是 thread/list 的过滤参数，与 utility 进程的 cwd 无关。
-      const res = await utilityRequest<{ data?: RawThread[] }>('thread/list', {
-        cwd,
-        limit,
-        sortKey: 'created_at',
-        sortDirection: 'desc',
-      });
+      const res = await utilityRequest<{ data?: RawThread[] }>(
+        'thread/list',
+        { cwd, limit, sortKey: 'created_at', sortDirection: 'desc' },
+        { env: runtime?.env },
+      );
       return (res.data ?? [])
         .filter((t) => !t.ephemeral)
         .map((t) => ({
@@ -633,10 +638,10 @@ export class CodexAppServerBackend implements AgentBackend {
     }
   }
 
-  async readHistory(cwd: string, sessionId: string, maxTurns = 10): Promise<ThreadHistory> {
+  async readHistory(cwd: string, sessionId: string, maxTurns = 10, runtime?: BackendRuntimeOptions): Promise<ThreadHistory> {
     void cwd; // thread/read 按 threadId 寻址，cwd 仅为接口形状保留
     const empty: ThreadHistory = { turns: [], totalTurns: 0 };
-    if (!resolveCodexBin()) return empty;
+    if (!(runtime?.env?.CODEX_BIN || resolveCodexBin())) return empty;
     // 常驻 utility client（M-2）。thread/read does NOT start a turn or load the
     // thread live — it just reads the rollout, so no token cost; the session is
     // resumed lazily on the topic's first message via resolveThread. The deadline
@@ -646,7 +651,7 @@ export class CodexAppServerBackend implements AgentBackend {
       const res = await utilityRequest<{ thread: Thread }>(
         'thread/read',
         { threadId: sessionId, includeTurns: true },
-        { timeoutMs: READ_HISTORY_TIMEOUT_MS },
+        { timeoutMs: READ_HISTORY_TIMEOUT_MS, env: runtime?.env },
       );
       const thread = res.thread;
       const all = (Array.isArray(thread?.turns) ? thread.turns : [])
@@ -668,28 +673,36 @@ export class CodexAppServerBackend implements AgentBackend {
     }
   }
 
-  async readSessionTitle(cwd: string, sessionId: string): Promise<string | undefined> {
+  async readSessionTitle(cwd: string, sessionId: string, runtime?: BackendRuntimeOptions): Promise<string | undefined> {
     void cwd; // thread/read is addressed by threadId; cwd remains backend-neutral API shape.
-    const res = await this.titleDeps.utilityRequest<{ thread: Thread }>(
-      'thread/read',
-      { threadId: sessionId, includeTurns: false },
-      { timeoutMs: READ_HISTORY_TIMEOUT_MS },
-    );
+    const params = { threadId: sessionId, includeTurns: false };
+    const res = runtime?.env
+      ? await this.titleDeps.utilityRequest<{ thread: Thread }>('thread/read', params, {
+          timeoutMs: READ_HISTORY_TIMEOUT_MS,
+          env: runtime.env,
+        })
+      : await this.titleDeps.utilityRequest<{ thread: Thread }>('thread/read', params, {
+          timeoutMs: READ_HISTORY_TIMEOUT_MS,
+        });
     const title = res.thread?.name?.trim();
     return title || undefined;
   }
 
-  async setSessionTitle(cwd: string, sessionId: string, title: string): Promise<void> {
+  async setSessionTitle(cwd: string, sessionId: string, title: string, runtime?: BackendRuntimeOptions): Promise<void> {
     void cwd;
     const clean = title.trim();
     if (!clean) throw new Error('Cannot set an empty Codex session title');
-    await this.titleDeps.utilityRequest('thread/name/set', { threadId: sessionId, name: clean });
+    const params = { threadId: sessionId, name: clean };
+    if (runtime?.env) await this.titleDeps.utilityRequest('thread/name/set', params, { env: runtime.env });
+    else await this.titleDeps.utilityRequest('thread/name/set', params);
   }
 
   async generateSessionTitle(opts: GenerateSessionTitleOptions): Promise<string | undefined> {
-    const bin = this.titleDeps.resolveBin();
+    const bin = opts.env?.CODEX_BIN || this.titleDeps.resolveBin();
     if (!bin) throw new Error('codex CLI not found (set CODEX_BIN or install @openai/codex)');
-    const client = this.titleDeps.createClient(bin, opts.cwd);
+    const client = opts.env
+      ? this.titleDeps.createClient(bin, opts.cwd, opts.env)
+      : this.titleDeps.createClient(bin, opts.cwd);
     try {
       return await withTitleDeadline(
         (async () => {
@@ -708,7 +721,7 @@ export class CodexAppServerBackend implements AgentBackend {
     // Build sandbox params first — the platform fail-closed guard throws here,
     // before we spawn, so a rejected tier leaves no orphan app-server process.
     const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
-    const client = await this.spawn(opts.cwd);
+    const client = await this.spawn(opts.cwd, opts.env);
     const res = await client.request<{ thread: { id: string } }>('thread/start', {
       cwd: opts.cwd,
       approvalPolicy: APPROVAL_POLICY,
@@ -721,7 +734,7 @@ export class CodexAppServerBackend implements AgentBackend {
 
   async resumeThread(opts: ResumeThreadOptions): Promise<AgentThread> {
     const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
-    const client = await this.spawn(opts.cwd);
+    const client = await this.spawn(opts.cwd, opts.env);
     const res = await client.request<{ thread: { id: string } }>('thread/resume', {
       threadId: opts.sessionId,
       cwd: opts.cwd,
@@ -733,16 +746,16 @@ export class CodexAppServerBackend implements AgentBackend {
     return new CodexThread(client, res.thread.id, opts.model, opts.effort);
   }
 
-  private async spawn(cwd: string): Promise<AppServerClient> {
-    const bin = resolveCodexBin();
+  private async spawn(cwd: string, env?: BackendEnvironment): Promise<AppServerClient> {
+    const bin = env?.CODEX_BIN || resolveCodexBin();
     if (!bin) throw new Error('codex CLI not found (set CODEX_BIN or install @openai/codex)');
     // 预热池（M-2）：取走（或扑空）都异步补位——下一个会话拿到的就是热进程
     // （MCP 已启动，thread/start 从 ~2.1s 冷路径降到 ~64ms）。热进程的 spawn
     // cwd 是中性目录，没关系：thread/start|resume 的 cwd 是 thread 级参数。
-    const warmed = takeWarmClient(bin);
-    void refillWarmPool();
+    const warmed = takeWarmClient(bin, env);
+    void refillWarmPool(env);
     if (warmed) return warmed;
-    const client = new AppServerClient({ bin, cwd });
+    const client = new AppServerClient({ bin, cwd, env });
     await client.connect();
     return client;
   }

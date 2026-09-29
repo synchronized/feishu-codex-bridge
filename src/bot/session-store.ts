@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { paths } from '../config/paths';
-import { DEFAULT_BACKEND_ID, type ReasoningEffort } from '../agent/types';
+import { DEFAULT_BACKEND_ID, type BackendEnvironment, type ReasoningEffort } from '../agent/types';
 
 /**
  * A persisted session = one Feishu topic (thread) bound to a codex thread.
@@ -22,6 +22,10 @@ export interface SessionRecord {
    * resolveThread 按它路由 resume —— 项目事后换后端不影响既有会话的归属。
    * v1 文件缺省 → 默认 codex 后端（read() 时回填）。 */
   backend: string;
+  /** 创建/恢复该原生会话所用的命名配置及环境快照。快照只含非秘密白名单变量，
+   * 即使 profile 后续改名或删除，历史会话仍能从原 CODEX_HOME 恢复。 */
+  backendProfile?: string;
+  backendEnv?: BackendEnvironment;
   /** Present only when this binding points at a Bridge-owned native session
    * registered for one-time resume titling. Manual /resume records omit it. */
   titleJobKey?: string;
@@ -68,6 +72,7 @@ export interface SessionTitleJob {
   backend: string;
   sessionId: string;
   cwd: string;
+  backendEnv?: BackendEnvironment;
   phase: SessionTitlePhase;
   /** Clean first user prompt; terminal jobs may erase it after completion. */
   source?: string;

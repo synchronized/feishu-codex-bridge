@@ -139,6 +139,32 @@ feishu-codex-bridge doctor                      本地自检：后端 / 登录 /
 
 也支持绝对路径和 `~/code` 这类路径。请保留配置文件里的其他字段，修改后重启 bridge；该项只影响之后留空路径创建的空白项目，不会移动已有项目，也不影响手动填写的文件夹路径。
 
+### 为不同项目选择不同 Codex Home（可选）
+
+可在当前机器人的 `config.json` 顶层定义命名后端配置；环境变量使用白名单，API Key 等秘密不允许明文写入：
+
+```json
+{
+  "backendProfiles": {
+    "personal": {
+      "backend": "codex-appserver",
+      "env": {
+        "CODEX_HOME": "C:\\Users\\me\\.codex"
+      }
+    },
+    "work": {
+      "backend": "codex-appserver",
+      "env": {
+        "CODEX_HOME": "D:\\codex-work",
+        "HTTPS_PROXY": "http://127.0.0.1:7890"
+      }
+    }
+  }
+}
+```
+
+保存后重启 Bridge，再在 Web 控制台的“项目设置 → 后端 → 选择命名配置”中输入 `personal` 或 `work`。支持的变量为 `CODEX_HOME`、`CODEX_BIN`、`HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY`；路径必须是绝对路径或以 `~` 开头。配置只影响之后创建或手动恢复的会话，既有话题继续使用创建时保存的环境快照，避免运行中途切换 Codex 账号。
+
 ---
 
 ## ⚠️ 安全须知
